@@ -137,7 +137,7 @@ private struct ProfileRow: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            AvatarCircle(avatarData: avatarData, name: profileName)
+            RoundedSquareAvatarView(avatarData: avatarData, name: profileName, cornerRadius: 18)
                 .frame(width: 64, height: 64)
 
             VStack(alignment: .leading, spacing: 6) {
@@ -218,49 +218,33 @@ private struct ProfileRow: View {
 
 private struct ProfileDetailView: View {
     @EnvironmentObject private var store: AppStore
+    @Environment(\.dismiss) private var dismiss
     @State private var nameDraft: String = ""
-    @State private var pickedAvatarItem: PhotosPickerItem?
-    @State private var isImportingAvatar = false
     @State private var lastSavedName: String = ""
 
     var body: some View {
-        List {
-            Section {
-                HStack {
-                    Spacer()
-                    avatarPicker
-                        .frame(width: 140, height: 140)
-                    Spacer()
-                }
-                .listRowInsets(EdgeInsets(top: 14, leading: 0, bottom: 14, trailing: 0))
+        ProfileEditorList(
+            nameDraft: $nameDraft,
+            namePlaceholder: "Your name",
+            identifier: store.destinationHashHex,
+            onCopyIdentifier: {
+                UIPasteboard.general.string = store.destinationHashHex
+                store.appendLog("copied dest hash")
+            },
+            avatar: {
+                avatarPicker
             }
-
-            Section("Name") {
-                TextField("Your name", text: $nameDraft)
-                    .textInputAutocapitalization(.words)
-            }
-
-            Section("Identifier") {
-                HStack(spacing: 8) {
-                    Text(store.destinationHashHex)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
-                    Button {
-                        UIPasteboard.general.string = store.destinationHashHex
-                        store.appendLog("copied dest hash")
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                    }
-                }
-            }
-
-        }
-        .listStyle(.insetGrouped)
-        .navigationTitle("Profile")
+        )
+        .navigationBarBackButtonHidden(true)
         .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "chevron.left")
+                }
+            }
+
             if isDirty {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") {
@@ -273,55 +257,20 @@ private struct ProfileDetailView: View {
             nameDraft = store.profileName
             lastSavedName = store.profileName
         }
-#if !targetEnvironment(macCatalyst)
-        .onChange(of: pickedAvatarItem) { newItem in
-            guard let newItem else { return }
-            Task { @MainActor in
-                defer { pickedAvatarItem = nil }
-                do {
-                    if let data = try await newItem.loadTransferable(type: Data.self) {
-                        store.setProfileAvatarData(data)
-                        store.appendLog("avatar updated")
-                    }
-                } catch {
-                    store.appendLog("avatar pick failed: \(error)")
-                }
-            }
-        }
-#endif
-        .fileImporter(
-            isPresented: $isImportingAvatar,
-            allowedContentTypes: [.image],
-            allowsMultipleSelection: false
-        ) { result in
-            do {
-                let url = try result.get().first
-                guard let url else { return }
-                let data = try Data(contentsOf: url)
-                store.setProfileAvatarData(data)
-                store.appendLog("avatar updated")
-            } catch {
-                store.appendLog("avatar pick failed: \(error)")
-            }
-        }
     }
 
     @ViewBuilder
     private var avatarPicker: some View {
-#if targetEnvironment(macCatalyst)
-        Button {
-            isImportingAvatar = true
-        } label: {
-            AvatarCircle(avatarData: store.profileAvatarData, name: store.profileName)
-                .frame(width: 140, height: 140)
-        }
-        .buttonStyle(.plain)
-#else
-        PhotosPicker(selection: $pickedAvatarItem, matching: .images) {
-            AvatarCircle(avatarData: store.profileAvatarData, name: store.profileName)
-                .frame(width: 140, height: 140)
-        }
-#endif
+        AvatarPicker(
+            avatarData: store.profileAvatarData,
+            name: store.profileName,
+            maxSide: 280,
+            cornerRadius: 18,
+            onAvatarData: { data in
+                store.setProfileAvatarData(data)
+                store.appendLog("avatar updated")
+            }
+        )
     }
 
     private var isDirty: Bool {
@@ -335,35 +284,6 @@ private struct ProfileDetailView: View {
         store.persist()
         store.restartEngineSilently()
         lastSavedName = newName
-    }
-}
-
-private struct AvatarCircle: View {
-    let avatarData: Data?
-    let name: String
-
-    var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
-        Group {
-            if let avatarData, let uiImage = UIImage(data: avatarData) {
-                Image(uiImage: uiImage)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                shape
-                    .fill(Color.accentColor.opacity(0.18))
-                    .overlay(shape.stroke(Color.accentColor.opacity(0.35), lineWidth: 1))
-                    .overlay(Text(initials(from: name)).font(.headline))
-            }
-        }
-        .clipShape(shape)
-    }
-
-    private func initials(from name: String) -> String {
-        let parts = name.split(separator: " ").map(String.init)
-        let letters = parts.prefix(2).compactMap { $0.first }.map { String($0).uppercased() }
-        if !letters.isEmpty { return letters.joined() }
-        return "ME"
     }
 }
 

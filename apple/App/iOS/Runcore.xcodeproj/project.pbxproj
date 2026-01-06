@@ -18,6 +18,7 @@
 		B00000090000000000000009 /* ../../Frameworks/iOS/Runcore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = B00001100000000000000010 /* ../../Frameworks/iOS/Runcore.xcframework */; };
 		B000000A000000000000000A /* CoreBluetooth.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B00001110000000000000011 /* CoreBluetooth.framework */; };
 		B000000B000000000000000B /* SidebarToggleHider.swift in Sources */ = {isa = PBXBuildFile; fileRef = B000010B000000000000000B /* SidebarToggleHider.swift */; };
+		B000000C000000000000000C /* AvatarComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = B000010C000000000000000C /* AvatarComponents.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -32,6 +33,7 @@
 		B00001080000000000000008 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B00001090000000000000009 /* RuncoreBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RuncoreBridge.h; sourceTree = "<group>"; };
 		B000010B000000000000000B /* SidebarToggleHider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarToggleHider.swift; sourceTree = "<group>"; };
+		B000010C000000000000000C /* AvatarComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AvatarComponents.swift; sourceTree = "<group>"; };
 		B00001100000000000000010 /* ../../Frameworks/iOS/Runcore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = ../../Frameworks/iOS/Runcore.xcframework; sourceTree = SOURCE_ROOT; };
 		B00001110000000000000011 /* CoreBluetooth.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreBluetooth.framework; path = System/Library/Frameworks/CoreBluetooth.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
@@ -66,6 +68,7 @@
 				B00001040000000000000004 /* Models.swift */,
 				B00001050000000000000005 /* AddContactView.swift */,
 				B00001060000000000000006 /* SettingsView.swift */,
+				B000010C000000000000000C /* AvatarComponents.swift */,
 				B000010B000000000000000B /* SidebarToggleHider.swift */,
 				B00001070000000000000007 /* RuncoreEngine.swift */,
 				B00001090000000000000009 /* RuncoreBridge.h */,
@@ -172,6 +175,7 @@
 				B00000060000000000000006 /* SettingsView.swift in Sources */,
 				B00000070000000000000007 /* RuncoreEngine.swift in Sources */,
 				B000000B000000000000000B /* SidebarToggleHider.swift in Sources */,
+				B000000C000000000000000C /* AvatarComponents.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

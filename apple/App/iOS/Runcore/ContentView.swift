@@ -1,11 +1,9 @@
 import SwiftUI
 import UIKit
 import PhotosUI
-import UniformTypeIdentifiers
 
 private enum ContactsRoute: Hashable {
     case chat(UUID)
-    case profile(UUID)
 }
 
 struct ContentView: View {
@@ -57,9 +55,6 @@ private struct ContactsTabView: View {
                         switch route {
                         case .chat:
                             Text("Chat not found")
-                        case .profile(let contactID):
-                            ContactProfileView(contactID: contactID)
-                                .environmentObject(store)
                         }
                     }
                     .onChange(of: store.selectedContactID) { _ in
@@ -83,9 +78,6 @@ private struct ContactsTabView: View {
                                 } else {
                                     Text("Chat not found")
                                 }
-                            case .profile(let contactID):
-                                ContactProfileView(contactID: contactID)
-                                    .environmentObject(store)
                             }
                         }
                 }
@@ -107,16 +99,22 @@ private struct ContactsTabView: View {
 
     private var contactsList: some View {
         Group {
-             if horizontalSizeClass == .regular {
-                List(selection: $store.selectedContactID) {
-                    ForEach(store.contacts) { contact in
-                        contactRow(contact)
-                            .tag(contact.id)
-                            .listRowInsets(EdgeInsets())
-                            .listRowBackground(Color.clear)
-                    }
-                }
-                .listStyle(.plain)
+            if horizontalSizeClass == .regular {
+               List {
+                   ForEach(store.contacts) { contact in
+                       Button {
+                           store.selectedContactID = contact.id
+                       } label: {
+                           contactRow(contact)
+                       }
+                       .buttonStyle(.plain)
+                       .listRowInsets(EdgeInsets())
+                       .listRowBackground(rowBackground(for: contact))
+                       .listRowSeparator(.hidden)
+                   }
+               }
+               .listStyle(.plain)
+               .listRowSeparator(.hidden)
             } else {
                 List {
                     ForEach(store.contacts) { contact in
@@ -128,9 +126,11 @@ private struct ContactsTabView: View {
                         .buttonStyle(.plain)
                         .listRowInsets(EdgeInsets())
                         .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
                     }
                 }
                 .listStyle(.plain)
+                .listRowSeparator(.hidden)
             }
         }
         .navigationTitle("Contacts")
@@ -171,6 +171,19 @@ private struct ContactsTabView: View {
             } label: {
                 Text("Delete")
             }
+        }
+    }
+
+    @ViewBuilder
+    private func rowBackground(for contact: Contact) -> some View {
+        let isSelected = horizontalSizeClass == .regular && store.selectedContactID == contact.id
+        if isSelected {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.accentColor.opacity(0.18))
+                .padding(.horizontal, 4)
+                .padding(.vertical, 1)
+        } else {
+            Color.clear
         }
     }
 
@@ -317,7 +330,10 @@ private struct ChatView: View {
         .toolbar {
             if contact != nil {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    NavigationLink(value: ContactsRoute.profile(contactID)) {
+                    NavigationLink {
+                        ContactProfileView(contactID: contactID)
+                            .environmentObject(store)
+                    } label: {
                         let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
                         ContactAvatarRoundedRect(avatarData: avatarData, name: displayName)
                             .modifier(ProfileAvatarSizer())
@@ -378,8 +394,6 @@ private struct ContactProfileView: View {
 
     @State private var nameDraft: String = ""
     @State private var lastSavedName: String = ""
-    @State private var pickedAvatarItem: PhotosPickerItem?
-    @State private var isImportingAvatar = false
 
     private var contact: Contact? {
         store.contacts.first(where: { $0.id == contactID })
@@ -387,38 +401,18 @@ private struct ContactProfileView: View {
 
     var body: some View {
         if let contact {
-            List {
-                avatarPicker(contact: contact)
-                    .listRowInsets(EdgeInsets())
-                    .clipShape(ContainerRelativeShape())
-                    .listRowBackground(Color.clear)
-                    .frame(maxWidth: .infinity)
-                    .contentShape(Rectangle())
-                    .padding(.vertical, 8)
-
-                Section("Name") {
-                    TextField("Local name", text: $nameDraft)
-                        .textInputAutocapitalization(.words)
+            ProfileEditorList(
+                nameDraft: $nameDraft,
+                namePlaceholder: "Local name",
+                identifier: contact.destinationHashHex,
+                onCopyIdentifier: {
+                    UIPasteboard.general.string = contact.destinationHashHex
+                    store.appendLog("copied contact id")
+                },
+                avatar: {
+                    avatarPicker(contact: contact)
                 }
-
-                Section("Identifier") {
-                    HStack(spacing: 8) {
-                        Text(contact.destinationHashHex)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .lineLimit(1)
-                        Spacer(minLength: 0)
-                        Button {
-                            UIPasteboard.general.string = contact.destinationHashHex
-                            store.appendLog("copied contact id")
-                        } label: {
-                            Image(systemName: "doc.on.doc")
-                        }
-                    }
-                }
-            }
-            .listStyle(.insetGrouped)
+            )
             .navigationBarBackButtonHidden(true)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
@@ -444,31 +438,10 @@ private struct ContactProfileView: View {
                 nameDraft = effectiveName
                 lastSavedName = effectiveName
             }
-#if !targetEnvironment(macCatalyst)
-            .onChange(of: pickedAvatarItem) { newItem in
-                guard let newItem else { return }
-                Task { @MainActor in
-                    defer { pickedAvatarItem = nil }
-                    if let data = try? await newItem.loadTransferable(type: Data.self) {
-                        store.setContactLocalAvatar(id: contactID, data: data)
-                    }
-                }
-            }
-#endif
-            .fileImporter(
-                isPresented: $isImportingAvatar,
-                allowedContentTypes: [.image],
-                allowsMultipleSelection: false
-            ) { result in
-                if let url = try? result.get().first,
-                   let data = try? Data(contentsOf: url) {
-                    store.setContactLocalAvatar(id: contactID, data: data)
-                }
-            }
         } else {
-                Text("Contact not found")
-                    .foregroundStyle(.secondary)
-                    .navigationBarBackButtonHidden(true)
+            Text("Contact not found")
+                .foregroundStyle(.secondary)
+                .navigationBarBackButtonHidden(true)
                 .toolbar {
                     ToolbarItem(placement: .navigationBarLeading) {
                         Button {
@@ -483,27 +456,15 @@ private struct ContactProfileView: View {
 
     @ViewBuilder
     private func avatarPicker(contact: Contact) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
-#if targetEnvironment(macCatalyst)
-        Button {
-            isImportingAvatar = true
-        } label: {
-            ContactProfileAvatarView(avatarData: contact.resolvedAvatarData, name: contact.resolvedDisplayName)
-                .modifier(ProfileAvatarSizer())
-                .frame(maxWidth: 280, maxHeight: 280)
-        }
-        .buttonStyle(.plain)
-        .clipShape(shape)
-        .overlay(shape.stroke(.secondary.opacity(0.3), lineWidth: 0.5))
-#else
-        PhotosPicker(selection: $pickedAvatarItem, matching: .images) {
-            ContactProfileAvatarView(avatarData: contact.resolvedAvatarData, name: contact.resolvedDisplayName)
-                .modifier(ProfileAvatarSizer())
-                .frame(maxWidth: 280, maxHeight: 280)
-        }
-        .clipShape(shape)
-        .overlay(shape.stroke(.secondary.opacity(0.3), lineWidth: 0.5))
-#endif
+        AvatarPicker(
+            avatarData: contact.resolvedAvatarData,
+            name: contact.resolvedDisplayName,
+            maxSide: 280,
+            cornerRadius: 18,
+            onAvatarData: { data in
+                store.setContactLocalAvatar(id: contactID, data: data)
+            }
+        )
     }
 
     private func isDirty(remoteName: String) -> Bool {
@@ -524,38 +485,6 @@ private struct ContactProfileView: View {
         }
         store.setContactLocalName(id: contactID, name: trimmed)
         lastSavedName = trimmed
-    }
-}
-
-private struct ContactProfileAvatarView: View {
-    let avatarData: Data?
-    let name: String
-
-    var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
-        ZStack {
-            if let avatarData, let uiImage = UIImage(data: avatarData) {
-                Image(uiImage: uiImage)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                shape.fill(Color.accentColor.opacity(0.15))
-                Text(initials(from: name))
-                    .font(.system(size: 42, weight: .semibold))
-                    .foregroundStyle(Color.accentColor.opacity(0.65))
-            }
-        }
-        .clipShape(shape)
-        .clipped()
-    }
-
-    private func initials(from name: String) -> String {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return "?" }
-        let parts = trimmed.split(separator: " ").map(String.init)
-        let letters = parts.prefix(2).compactMap { $0.first }.map { String($0).uppercased() }
-        if !letters.isEmpty { return letters.joined() }
-        return "?"
     }
 }
 
