@@ -7,6 +7,13 @@
 *.dll
 *.so
 *.dylib
+.go*
+.derived*
+.node*
+.tmp
+.tmp_ios
+.cache
+
 
 # Test binary, built with `go test -c`
 *.test
