@@ -434,6 +434,9 @@ private struct ChatView: View {
                         proxy.scrollTo(newID, anchor: .bottom)
                     }
                 }
+                .onChange(of: store.lastMessageID(for: contactID)) { _ in
+                    store.markChatRead(contactID: contactID)
+                }
             }
 
             Divider()
@@ -453,6 +456,9 @@ private struct ChatView: View {
             .padding(12)
         }
         .navigationTitle(displayName)
+        .onAppear {
+            store.markChatRead(contactID: contactID)
+        }
     }
 }
 
@@ -598,6 +604,9 @@ private struct MessageRow: View {
                     Text(message.timestamp, style: .time)
                         .font(.caption2)
                         .foregroundStyle(isOutgoing ? .white.opacity(0.75) : .secondary)
+                    if isOutgoing {
+                        receiptMarks
+                    }
                 }
             }
             .padding(.horizontal, 12)
@@ -607,6 +616,29 @@ private struct MessageRow: View {
             .frame(maxWidth: maxBubbleWidth, alignment: .leading)
 
             if !isOutgoing { Spacer(minLength: 0) }
+        }
+    }
+
+    @ViewBuilder
+    private var receiptMarks: some View {
+        switch message.outboundStatus {
+        case .delivered:
+            Image(systemName: "checkmark")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.75))
+        case .read:
+            HStack(spacing: 1) {
+                Image(systemName: "checkmark")
+                Image(systemName: "checkmark")
+            }
+            .font(.caption2)
+            .foregroundStyle(.white.opacity(0.75))
+        case .failed:
+            Image(systemName: "exclamationmark.circle")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.85))
+        case .pending, .none:
+            EmptyView()
         }
     }
 }

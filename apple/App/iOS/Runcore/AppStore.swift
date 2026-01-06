@@ -43,16 +43,22 @@ final class AppStore: ObservableObject {
     private var inboundPromptQueue: [InboundPrompt] = []
     private var inboundAvatarTask: Task<Void, Never>?
 
+    private let readReceiptTitle = "_read"
+    private var outboundRetryTask: Task<Void, Never>?
+    private var outboundRetryInFlight: Set<UUID> = []
+
     struct InboundPrompt: Identifiable, Equatable {
         let id: UUID
         let destHashHex: String
+        let messageIDHex: String
         let title: String
         let content: String
         let receivedAt: Date
 
-        init(destHashHex: String, title: String, content: String, receivedAt: Date = Date()) {
+        init(destHashHex: String, messageIDHex: String, title: String, content: String, receivedAt: Date = Date()) {
             self.id = UUID()
             self.destHashHex = destHashHex
+            self.messageIDHex = messageIDHex
             self.title = title
             self.content = content
             self.receivedAt = receivedAt
@@ -67,23 +73,35 @@ final class AppStore: ObservableObject {
             guard let self else { return }
             self.appendRawLog(line)
         }
-        engine.onInbound = { [weak self] destHex, title, content in
+        engine.onInbound = { [weak self] srcHex, messageIDHex, title, content in
             guard let self else { return }
-            let dest = self.normalizeDestinationHashHex(destHex)
-            self.appendLog("inbound src=\(dest) title=\(title)")
+            let src = self.normalizeDestinationHashHex(srcHex)
+            let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.appendLog("inbound src=\(src) title=\(trimmedTitle)")
 
-            if self.isBlockedDestination(dest) {
-                self.appendLog("inbound dropped (blocked) src=\(dest)")
+            if self.isBlockedDestination(src) {
+                self.appendLog("inbound dropped (blocked) src=\(src)")
                 return
             }
 
-            if let contact = self.contacts.first(where: { $0.destinationHashHex == dest }) {
-                self.messagesByContactID[contact.id, default: []].append(ChatMessage(direction: .inbound, text: content, title: title))
+            if trimmedTitle == self.readReceiptTitle {
+                self.applyReadReceipt(from: src, content: content)
+                return
+            }
+
+            if let contact = self.contacts.first(where: { $0.destinationHashHex == src }) {
+                self.messagesByContactID[contact.id, default: []].append(
+                    ChatMessage(direction: .inbound, text: content, title: trimmedTitle, lxmfMessageIDHex: messageIDHex)
+                )
                 self.save()
                 return
             }
 
-            self.enqueueInboundPrompt(InboundPrompt(destHashHex: dest, title: title, content: content))
+            self.enqueueInboundPrompt(InboundPrompt(destHashHex: src, messageIDHex: messageIDHex, title: trimmedTitle, content: content))
+        }
+        engine.onMessageStatus = { [weak self] destHex, messageIDHex, state in
+            guard let self else { return }
+            self.applyOutboundStatus(destHashHex: destHex, messageIDHex: messageIDHex, state: state)
         }
         engine.start()
         appendLog("engine started (iOS stub)")
@@ -104,10 +122,20 @@ final class AppStore: ObservableObject {
                 self.refreshAnnounces()
             }
         }
+
+        outboundRetryTask?.cancel()
+        outboundRetryTask = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                if Task.isCancelled { return }
+                self.retryPendingOutboundIfNeeded()
+            }
+        }
     }
 
     deinit {
         statsPollTask?.cancel()
+        outboundRetryTask?.cancel()
     }
 
     var destinationHashHex: String { engine.destinationHashHex() }
@@ -275,6 +303,7 @@ final class AppStore: ObservableObject {
     }
 
     func refreshAnnounces() {
+        let previous = announces
         let json = engine.announcesJSON()
         lastAnnouncesJSON = json
         if json.isEmpty {
@@ -287,6 +316,18 @@ final class AppStore: ObservableObject {
             let snapshot = try JSONDecoder().decode(AnnounceSnapshot.self, from: data)
             announces = snapshot.announces
             lastAnnouncesError = snapshot.error
+
+            let prevByDest: [String: Int64] = Dictionary(
+                uniqueKeysWithValues: previous.map { (normalizeDestinationHashHex($0.destinationHashHex), $0.lastSeen) }
+            )
+            for entry in snapshot.announces {
+                let dest = normalizeDestinationHashHex(entry.destinationHashHex)
+                guard !dest.isEmpty else { continue }
+                let prevSeen = prevByDest[dest]
+                if prevSeen == nil || (prevSeen ?? 0) < entry.lastSeen {
+                    retryPendingOutboundNow(destHashHex: dest)
+                }
+            }
         } catch {
             appendLog("failed to parse announces: \(error)")
             announces = []
@@ -460,21 +501,210 @@ final class AppStore: ObservableObject {
     }
 
     func sendMessage(to contactID: UUID, text: String) {
-        let msg = ChatMessage(direction: .outbound, text: text, title: "")
+        var msg = ChatMessage(direction: .outbound, text: text, title: "msg", outboundStatus: .pending)
         messagesByContactID[contactID, default: []].append(msg)
         save()
         guard let contact = contacts.first(where: { $0.id == contactID }) else { return }
         let dest = contact.destinationHashHex
+        let localMsgID = msg.id
         Task.detached { [weak self] in
             guard let self else { return }
-            let rc = self.engine.send(destHashHex: dest, title: "msg", content: text)
+            let result = self.engine.sendResult(destHashHex: dest, title: "msg", content: text)
             await MainActor.run {
-                if rc == 0 {
-                    self.appendLog("send to=\(dest)")
+                self.updateOutboundMessage(contactID: contactID, localID: localMsgID, sendResult: result)
+            }
+        }
+    }
+
+    func markChatRead(contactID: UUID) {
+        guard let contact = contacts.first(where: { $0.id == contactID }) else { return }
+        let dest = contact.destinationHashHex
+        let ids: [String] = (messagesByContactID[contactID] ?? []).compactMap { m in
+            guard m.direction == .inbound else { return nil }
+            guard m.didSendReadReceipt == false else { return nil }
+            let mid = (m.lxmfMessageIDHex ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !mid.isEmpty else { return nil }
+            return mid
+        }
+        guard !ids.isEmpty else { return }
+
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let result = self.engine.sendResult(destHashHex: dest, title: self.readReceiptTitle, content: ids.joined(separator: "\n"))
+            await MainActor.run {
+                if result.rc == 0 {
+                    self.markInboundReadReceiptsSent(contactID: contactID, messageIDs: ids)
+                    self.appendLog("read receipts sent to=\(dest) n=\(ids.count)")
                 } else {
-                    self.appendLog("send failed rc=\(rc) to=\(dest)")
+                    self.appendLog("read receipts send failed rc=\(result.rc) to=\(dest)")
                 }
             }
+        }
+    }
+
+    private func updateOutboundMessage(contactID: UUID, localID: UUID, sendResult: RuncoreEngine.SendResult) {
+        guard var list = messagesByContactID[contactID] else { return }
+        guard let idx = list.firstIndex(where: { $0.id == localID }) else { return }
+
+        let dest = contacts.first(where: { $0.id == contactID })?.destinationHashHex ?? ""
+        list[idx].outboundAttemptCount += 1
+        list[idx].lastOutboundAttemptAt = Date()
+        if sendResult.rc == 0 {
+            let mid = (sendResult.messageIDHex ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            list[idx].lxmfMessageIDHex = mid.isEmpty ? nil : mid
+            list[idx].outboundStatus = .pending
+            messagesByContactID[contactID] = list
+            save()
+            appendLog("send queued to=\(dest)")
+        } else {
+            // Retry later; only count hard failures (not "no path"/"no identity").
+            if sendResult.rc != 3 && sendResult.rc != 4 {
+                list[idx].outboundFailureCount += 1
+            }
+            if list[idx].outboundFailureCount >= 6 {
+                list[idx].outboundStatus = .failed
+            } else {
+                list[idx].outboundStatus = .pending
+            }
+            messagesByContactID[contactID] = list
+            save()
+            let suffix = (sendResult.error?.isEmpty == false) ? " err=\(sendResult.error!)" : ""
+            appendLog("send pending rc=\(sendResult.rc) to=\(dest)\(suffix)")
+        }
+    }
+
+    private func retryPendingOutboundIfNeeded() {
+        for contact in contacts {
+            guard var list = messagesByContactID[contact.id] else { continue }
+            guard let idx = list.firstIndex(where: { msg in
+                msg.direction == .outbound &&
+                    msg.outboundStatus == .pending &&
+                    normalizeDestinationHashHex(msg.lxmfMessageIDHex ?? "").isEmpty &&
+                    msg.outboundFailureCount < 6 &&
+                    !outboundRetryInFlight.contains(msg.id)
+            }) else { continue }
+
+            let msgID = list[idx].id
+            let now = Date()
+            let backoff = min(pow(2.0, Double(max(0, list[idx].outboundAttemptCount))) * 1.5, 30.0)
+            if let last = list[idx].lastOutboundAttemptAt, now.timeIntervalSince(last) < backoff {
+                continue
+            }
+
+            outboundRetryInFlight.insert(msgID)
+            let text = list[idx].text
+            let title = list[idx].title
+            messagesByContactID[contact.id] = list
+
+            Task.detached { [weak self] in
+                guard let self else { return }
+                let result = self.engine.sendResult(destHashHex: contact.destinationHashHex, title: title, content: text)
+                await MainActor.run {
+                    self.updateOutboundMessage(contactID: contact.id, localID: msgID, sendResult: result)
+                    self.outboundRetryInFlight.remove(msgID)
+                }
+            }
+
+            // Do one retry per tick to avoid spamming.
+            return
+        }
+    }
+
+    private func retryPendingOutboundNow(destHashHex: String) {
+        let dest = normalizeDestinationHashHex(destHashHex)
+        guard let contact = contacts.first(where: { $0.destinationHashHex == dest }) else { return }
+        guard var list = messagesByContactID[contact.id] else { return }
+        guard let idx = list.firstIndex(where: { msg in
+            msg.direction == .outbound &&
+                msg.outboundStatus == .pending &&
+                normalizeDestinationHashHex(msg.lxmfMessageIDHex ?? "").isEmpty &&
+                msg.outboundFailureCount < 6 &&
+                !outboundRetryInFlight.contains(msg.id)
+        }) else { return }
+
+        let msgID = list[idx].id
+        outboundRetryInFlight.insert(msgID)
+        let text = list[idx].text
+        let title = list[idx].title
+        messagesByContactID[contact.id] = list
+
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let result = self.engine.sendResult(destHashHex: dest, title: title, content: text)
+            await MainActor.run {
+                self.updateOutboundMessage(contactID: contact.id, localID: msgID, sendResult: result)
+                self.outboundRetryInFlight.remove(msgID)
+            }
+        }
+    }
+
+    private func applyOutboundStatus(destHashHex: String, messageIDHex: String, state: Int32) {
+        let dest = normalizeDestinationHashHex(destHashHex)
+        let mid = normalizeDestinationHashHex(messageIDHex)
+        guard !dest.isEmpty, !mid.isEmpty else { return }
+        guard let contact = contacts.first(where: { $0.destinationHashHex == dest }) else { return }
+        guard var list = messagesByContactID[contact.id] else { return }
+        guard let idx = list.firstIndex(where: { $0.direction == .outbound && normalizeDestinationHashHex($0.lxmfMessageIDHex ?? "") == mid }) else {
+            return
+        }
+
+        switch state {
+        case 0x08: // delivered
+            if list[idx].outboundStatus != .read {
+                list[idx].outboundStatus = .delivered
+            }
+        case 0xFD, 0xFE, 0xFF: // rejected/cancelled/failed
+            list[idx].outboundStatus = .failed
+        default:
+            break
+        }
+        messagesByContactID[contact.id] = list
+        save()
+    }
+
+    private func applyReadReceipt(from srcHashHex: String, content: String) {
+        let src = normalizeDestinationHashHex(srcHashHex)
+        guard let contact = contacts.first(where: { $0.destinationHashHex == src }) else { return }
+
+        let ids = content
+            .split(whereSeparator: { $0 == "\n" || $0 == "\r" || $0 == " " || $0 == "\t" || $0 == "," || $0 == ";" })
+            .map { normalizeDestinationHashHex(String($0)) }
+            .filter { !$0.isEmpty }
+        guard !ids.isEmpty else { return }
+
+        guard var list = messagesByContactID[contact.id] else { return }
+        var changed = false
+        for i in list.indices {
+            guard list[i].direction == .outbound else { continue }
+            let mid = normalizeDestinationHashHex(list[i].lxmfMessageIDHex ?? "")
+            if ids.contains(mid) {
+                list[i].outboundStatus = .read
+                changed = true
+            }
+        }
+        if changed {
+            messagesByContactID[contact.id] = list
+            save()
+        }
+    }
+
+    private func markInboundReadReceiptsSent(contactID: UUID, messageIDs: [String]) {
+        guard var list = messagesByContactID[contactID] else { return }
+        let set = Set(messageIDs.map { normalizeDestinationHashHex($0) })
+        var changed = false
+        for i in list.indices {
+            guard list[i].direction == .inbound else { continue }
+            let mid = normalizeDestinationHashHex(list[i].lxmfMessageIDHex ?? "")
+            if set.contains(mid) {
+                if list[i].didSendReadReceipt == false {
+                    list[i].didSendReadReceipt = true
+                    changed = true
+                }
+            }
+        }
+        if changed {
+            messagesByContactID[contactID] = list
+            save()
         }
     }
 
@@ -616,7 +846,9 @@ final class AppStore: ObservableObject {
                 contacts[idx].avatarHashHex = inboundPromptAvatarHashHex
             }
         }
-        messagesByContactID[contactID, default: []].append(ChatMessage(direction: .inbound, text: prompt.content, title: prompt.title))
+        messagesByContactID[contactID, default: []].append(
+            ChatMessage(direction: .inbound, text: prompt.content, title: prompt.title, lxmfMessageIDHex: prompt.messageIDHex)
+        )
         selectedContactID = contactID
         save()
         finishInboundPrompt()

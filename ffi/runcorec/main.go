@@ -4,13 +4,21 @@ package main
 #include <stdint.h>
  #include <stdlib.h>
 typedef void (*runcore_inbound_cb)(void* user_data, const char* src_hash_hex, const char* title, const char* content);
+typedef void (*runcore_inbound_cb2)(void* user_data, const char* src_hash_hex, const char* msg_id_hex, const char* title, const char* content);
 typedef void (*runcore_log_cb)(void* user_data, int32_t level, const char* line);
+typedef void (*runcore_message_status_cb)(void* user_data, const char* dest_hash_hex, const char* msg_id_hex, int32_t state);
 
 static inline void runcore_inbound_cb_call(runcore_inbound_cb cb, void* user_data, const char* src, const char* title, const char* content) {
   cb(user_data, src, title, content);
 }
+static inline void runcore_inbound_cb2_call(runcore_inbound_cb2 cb, void* user_data, const char* src, const char* msg_id, const char* title, const char* content) {
+  cb(user_data, src, msg_id, title, content);
+}
 static inline void runcore_log_cb_call(runcore_log_cb cb, void* user_data, int32_t level, const char* line) {
   cb(user_data, level, line);
+}
+static inline void runcore_message_status_cb_call(runcore_message_status_cb cb, void* user_data, const char* dest, const char* msg_id, int32_t state) {
+  cb(user_data, dest, msg_id, state);
 }
 */
 import "C"
@@ -18,6 +26,8 @@ import "C"
 import (
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -32,7 +42,10 @@ type nodeHandle struct {
 	node     *runcore.Node
 	destHex  *C.char
 	cb       C.runcore_inbound_cb
+	cb2      C.runcore_inbound_cb2
 	userData unsafe.Pointer
+	statusCB C.runcore_message_status_cb
+	statusUD unsafe.Pointer
 	mu       sync.RWMutex
 }
 
@@ -106,17 +119,28 @@ func runcore_start(configDir *C.char, displayName *C.char, loglevel C.int32_t, r
 		}
 		h.mu.RLock()
 		cb := h.cb
+		cb2 := h.cb2
 		ud := h.userData
 		h.mu.RUnlock()
-		if cb == nil {
+		if cb == nil && cb2 == nil {
 			return
 		}
 		src := hex.EncodeToString(m.SourceHash)
+		msgID := hex.EncodeToString(m.MessageID)
+		if msgID == "" && len(m.Hash) > 0 {
+			msgID = hex.EncodeToString(m.Hash)
+		}
 		cSrc := allocCString(src)
+		cMsgID := allocCString(msgID)
 		cTitle := allocCString(m.TitleAsString())
 		cContent := allocCString(m.ContentAsString())
-		C.runcore_inbound_cb_call(cb, ud, cSrc, cTitle, cContent)
+		if cb2 != nil {
+			C.runcore_inbound_cb2_call(cb2, ud, cSrc, cMsgID, cTitle, cContent)
+		} else if cb != nil {
+			C.runcore_inbound_cb_call(cb, ud, cSrc, cTitle, cContent)
+		}
 		C.free(unsafe.Pointer(cSrc))
+		C.free(unsafe.Pointer(cMsgID))
 		C.free(unsafe.Pointer(cTitle))
 		C.free(unsafe.Pointer(cContent))
 	})
@@ -163,6 +187,30 @@ func runcore_set_inbound_cb(handle C.uint64_t, cb C.runcore_inbound_cb, userData
 	h.mu.Lock()
 	h.cb = cb
 	h.userData = userData
+	h.mu.Unlock()
+}
+
+//export runcore_set_inbound_cb2
+func runcore_set_inbound_cb2(handle C.uint64_t, cb C.runcore_inbound_cb2, userData unsafe.Pointer) {
+	h := getHandle(handle)
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.cb2 = cb
+	h.userData = userData
+	h.mu.Unlock()
+}
+
+//export runcore_set_message_status_cb
+func runcore_set_message_status_cb(handle C.uint64_t, cb C.runcore_message_status_cb, userData unsafe.Pointer) {
+	h := getHandle(handle)
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.statusCB = cb
+	h.statusUD = userData
 	h.mu.Unlock()
 }
 
@@ -215,11 +263,19 @@ func runcore_send(handle C.uint64_t, destHashHex *C.char, title *C.char, content
 		return 1
 	}
 	dest := C.GoString(destHashHex)
-	// Best-effort: wait briefly for peer identity announce so UI sends "just work".
-	if _, err := h.node.WaitForIdentityHex(dest, 5*time.Second); err != nil {
+	destHash, err := hex.DecodeString(dest)
+	if err != nil || len(destHash) != lxmf.DestinationLength {
+		return 4
+	}
+	if !rns.TransportHasPath(destHash) {
+		rns.TransportRequestPath(destHash)
+		return 5
+	}
+	if !strings.EqualFold(dest, C.GoString(h.destHex)) && rns.IdentityRecall(destHash) == nil {
+		rns.TransportRequestPath(destHash)
 		return 3
 	}
-	_, err := h.node.SendHex(dest, runcore.SendOptions{
+	_, err = h.node.SendHex(dest, runcore.SendOptions{
 		Method:  lxmf.MethodOpportunistic,
 		Title:   C.GoString(title),
 		Content: C.GoString(content),
@@ -228,6 +284,93 @@ func runcore_send(handle C.uint64_t, destHashHex *C.char, title *C.char, content
 		return 2
 	}
 	return 0
+}
+
+//export runcore_send_result_json
+func runcore_send_result_json(handle C.uint64_t, destHashHex *C.char, title *C.char, content *C.char) *C.char {
+	h := getHandle(handle)
+	if h == nil || h.node == nil {
+		return allocCString(`{"rc":1,"error":"node not started"}`)
+	}
+	dest := C.GoString(destHashHex)
+	destHash, err := hex.DecodeString(dest)
+	if err != nil || len(destHash) != lxmf.DestinationLength {
+		b, _ := json.Marshal(map[string]any{"rc": 5, "error": "invalid destination hash"})
+		return allocCString(string(b))
+	}
+	if !rns.TransportHasPath(destHash) {
+		rns.TransportRequestPath(destHash)
+		b, _ := json.Marshal(map[string]any{"rc": 4, "error": "no path to destination"})
+		return allocCString(string(b))
+	}
+	if !strings.EqualFold(dest, C.GoString(h.destHex)) && rns.IdentityRecall(destHash) == nil {
+		rns.TransportRequestPath(destHash)
+		b, _ := json.Marshal(map[string]any{"rc": 3, "error": "unknown destination identity"})
+		return allocCString(string(b))
+	}
+	msg, err := h.node.SendHex(dest, runcore.SendOptions{
+		Method:  lxmf.MethodOpportunistic,
+		Title:   C.GoString(title),
+		Content: C.GoString(content),
+	})
+	if err != nil || msg == nil {
+		b, _ := json.Marshal(map[string]any{"rc": 2, "error": fmt.Sprintf("send failed: %v", err)})
+		return allocCString(string(b))
+	}
+
+	// Attach callbacks for delivery/failed state transitions.
+	msg.RegisterDeliveryCallback(func(m *lxmf.LXMessage) {
+		if m == nil {
+			return
+		}
+		h.mu.RLock()
+		cb := h.statusCB
+		ud := h.statusUD
+		h.mu.RUnlock()
+		if cb == nil {
+			return
+		}
+		destHex := hex.EncodeToString(m.DestinationHash)
+		msgIDHex := hex.EncodeToString(m.MessageID)
+		if msgIDHex == "" && len(m.Hash) > 0 {
+			msgIDHex = hex.EncodeToString(m.Hash)
+		}
+		cDest := allocCString(destHex)
+		cMsgID := allocCString(msgIDHex)
+		C.runcore_message_status_cb_call(cb, ud, cDest, cMsgID, C.int32_t(m.State))
+		C.free(unsafe.Pointer(cDest))
+		C.free(unsafe.Pointer(cMsgID))
+	})
+	msg.RegisterFailedCallback(func(m *lxmf.LXMessage) {
+		if m == nil {
+			return
+		}
+		h.mu.RLock()
+		cb := h.statusCB
+		ud := h.statusUD
+		h.mu.RUnlock()
+		if cb == nil {
+			return
+		}
+		destHex := hex.EncodeToString(m.DestinationHash)
+		msgIDHex := hex.EncodeToString(m.MessageID)
+		if msgIDHex == "" && len(m.Hash) > 0 {
+			msgIDHex = hex.EncodeToString(m.Hash)
+		}
+		cDest := allocCString(destHex)
+		cMsgID := allocCString(msgIDHex)
+		C.runcore_message_status_cb_call(cb, ud, cDest, cMsgID, C.int32_t(m.State))
+		C.free(unsafe.Pointer(cDest))
+		C.free(unsafe.Pointer(cMsgID))
+	})
+
+	msgIDHex := hex.EncodeToString(msg.MessageID)
+	if msgIDHex == "" && len(msg.Hash) > 0 {
+		msgIDHex = hex.EncodeToString(msg.Hash)
+	}
+	resp := map[string]any{"rc": 0, "message_id_hex": msgIDHex}
+	b, _ := json.Marshal(resp)
+	return allocCString(string(b))
 }
 
 //export runcore_announce

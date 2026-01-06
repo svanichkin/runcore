@@ -4,7 +4,8 @@ final class RuncoreEngine {
     private var handle: runcore_handle_t = 0
     private var cachedDestHex: String = ""
 
-    var onInbound: ((_ destHashHex: String, _ title: String, _ content: String) -> Void)?
+    var onInbound: ((_ srcHashHex: String, _ messageIDHex: String, _ title: String, _ content: String) -> Void)?
+    var onMessageStatus: ((_ destHashHex: String, _ messageIDHex: String, _ state: Int32) -> Void)?
     var onLogLine: ((_ level: Int32, _ line: String) -> Void)?
     var displayName: String = "Me"
     var logLevel: Int32 = 3
@@ -43,6 +44,18 @@ final class RuncoreEngine {
         }
     }
 
+    struct SendResult: Decodable {
+        let rc: Int32
+        let messageIDHex: String?
+        let error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case rc
+            case messageIDHex = "message_id_hex"
+            case error
+        }
+    }
+
     func start() {
         guard handle == 0 else { return }
 
@@ -65,14 +78,25 @@ final class RuncoreEngine {
         guard handle != 0 else { return }
         cachedDestHex = destinationHashHex()
 
-        runcore_set_inbound_cb(handle, { userData, srcHash, title, content in
+        runcore_set_inbound_cb2(handle, { userData, srcHash, msgID, title, content in
             guard let userData else { return }
             let engine = Unmanaged<RuncoreEngine>.fromOpaque(userData).takeUnretainedValue()
             let src = srcHash.map { String(cString: $0) } ?? ""
+            let mid = msgID.map { String(cString: $0) } ?? ""
             let t = title.map { String(cString: $0) } ?? ""
             let c = content.map { String(cString: $0) } ?? ""
             DispatchQueue.main.async {
-                engine.onInbound?(src, t, c)
+                engine.onInbound?(src, mid, t, c)
+            }
+        }, Unmanaged.passUnretained(self).toOpaque())
+
+        runcore_set_message_status_cb(handle, { userData, destHash, msgID, state in
+            guard let userData else { return }
+            let engine = Unmanaged<RuncoreEngine>.fromOpaque(userData).takeUnretainedValue()
+            let dest = destHash.map { String(cString: $0) } ?? ""
+            let mid = msgID.map { String(cString: $0) } ?? ""
+            DispatchQueue.main.async {
+                engine.onMessageStatus?(dest, mid, state)
             }
         }, Unmanaged.passUnretained(self).toOpaque())
 
@@ -175,15 +199,22 @@ final class RuncoreEngine {
         return String(cString: ptr)
     }
 
-    func send(destHashHex: String, title: String, content: String) -> Int32 {
-        guard handle != 0 else { return 1 }
-        return destHashHex.withCString { cDest in
+    func sendResult(destHashHex: String, title: String, content: String) -> SendResult {
+        guard handle != 0 else { return SendResult(rc: 1, messageIDHex: nil, error: "engine not started") }
+        let jsonPtr: UnsafeMutablePointer<CChar>? = destHashHex.withCString { cDest in
             title.withCString { cTitle in
                 content.withCString { cContent in
-                    runcore_send(handle, cDest, cTitle, cContent)
+                    runcore_send_result_json(handle, cDest, cTitle, cContent)
                 }
             }
         }
+        guard let jsonPtr else { return SendResult(rc: 2, messageIDHex: nil, error: "no response") }
+        defer { runcore_free_string(jsonPtr) }
+        let json = String(cString: jsonPtr)
+        guard let data = json.data(using: .utf8) else {
+            return SendResult(rc: 2, messageIDHex: nil, error: "invalid json")
+        }
+        return (try? JSONDecoder().decode(SendResult.self, from: data)) ?? SendResult(rc: 2, messageIDHex: nil, error: "decode failed")
     }
 
     func setAvatarPNG(_ data: Data) -> Int32 {

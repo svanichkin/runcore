@@ -17,6 +17,26 @@ typedef void (*runcore_inbound_cb)(
     const char* content
 );
 
+// Called on inbound message (v2). Includes LXMF message_id (hex).
+// All strings are UTF-8, valid only for the duration of the call.
+typedef void (*runcore_inbound_cb2)(
+    void* user_data,
+    const char* src_hash_hex,
+    const char* msg_id_hex,
+    const char* title,
+    const char* content
+);
+
+// Called on outbound message status updates.
+// `state` corresponds to lxmf.LXMessage.State (eg. 0x08 = delivered).
+// All strings are UTF-8, valid only for the duration of the call.
+typedef void (*runcore_message_status_cb)(
+    void* user_data,
+    const char* dest_hash_hex,
+    const char* msg_id_hex,
+    int32_t state
+);
+
 // Called for every internal log line. The line includes timestamp prefix.
 typedef void (*runcore_log_cb)(void* user_data, int32_t level, const char* line);
 
@@ -40,12 +60,23 @@ int32_t runcore_stop(runcore_handle_t handle);
 // Set inbound callback. Pass NULL to disable.
 void runcore_set_inbound_cb(runcore_handle_t handle, runcore_inbound_cb cb, void* user_data);
 
+// Set inbound callback (v2). Pass NULL to disable.
+void runcore_set_inbound_cb2(runcore_handle_t handle, runcore_inbound_cb2 cb, void* user_data);
+
+// Set outbound message status callback. Pass NULL to disable.
+void runcore_set_message_status_cb(runcore_handle_t handle, runcore_message_status_cb cb, void* user_data);
+
 // Returns this node's LXMF delivery destination hash as hex (32 chars).
 // The returned pointer is owned by the library and remains valid until runcore_stop().
 const char* runcore_destination_hash_hex(runcore_handle_t handle);
 
 // Send a message to `dest_hash_hex` (32 hex chars). Returns 0 on success.
 int32_t runcore_send(runcore_handle_t handle, const char* dest_hash_hex, const char* title, const char* content);
+
+// Send a message and return JSON with the message_id_hex (best-effort).
+// Response: {"rc":0,"message_id_hex":"...","error":"..."}.
+// The returned pointer must be freed with runcore_free_string().
+char* runcore_send_result_json(runcore_handle_t handle, const char* dest_hash_hex, const char* title, const char* content);
 
 // Announce this node's delivery destination. Returns 0 on success.
 int32_t runcore_announce(runcore_handle_t handle);
