@@ -28,6 +28,72 @@ struct ContentView: View {
         }
         .toolbar(removing: .sidebarToggle)
         .background(SidebarToggleHider())
+        .sheet(
+            item: Binding(get: { store.inboundPrompt }, set: { _ in }),
+            content: { prompt in
+                InboundPromptSheet(prompt: prompt)
+                    .environmentObject(store)
+                    .interactiveDismissDisabled()
+            }
+        )
+    }
+}
+
+private struct InboundPromptSheet: View {
+    @EnvironmentObject private var store: AppStore
+    let prompt: AppStore.InboundPrompt
+
+    var body: some View {
+        let name = store.displayNameForDestinationHashHex(prompt.destHashHex)
+        VStack(spacing: 14) {
+            Text(name)
+                .font(.title3)
+                .fontWeight(.semibold)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+
+            ZStack {
+                RoundedSquareAvatarView(avatarData: store.inboundPromptAvatarData, name: name, cornerRadius: 18)
+                    .frame(maxWidth: 280, maxHeight: 280)
+
+                if store.inboundPromptIsLoadingAvatar {
+                    ProgressView()
+                }
+            }
+            .frame(maxWidth: .infinity)
+
+            Text(prompt.destHashHex)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+
+            GeometryReader { proxy in
+                ScrollView {
+                    VStack {
+                        Spacer(minLength: 0)
+                        Text(prompt.content)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                        Spacer(minLength: 0)
+                    }
+                    .frame(minHeight: proxy.size.height)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button("Accept") { store.acceptInboundPrompt(prompt) }
+                    .buttonStyle(.borderedProminent)
+
+                Button("Decline", role: .cancel) { store.declineInboundPrompt(prompt) }
+                    .buttonStyle(.bordered)
+
+                Button("Block", role: .destructive) { store.blockInboundPrompt(prompt) }
+                    .buttonStyle(.bordered)
+            }
+        }
+        .padding(16)
+        .presentationDetents([.large])
     }
 }
 
@@ -92,7 +158,8 @@ private struct ContactsTabView: View {
                 },
                 resolvePreview: { destHashHex in
                     await store.resolveContactPreview(destHashHex: destHashHex)
-                }
+                },
+                announces: store.announces
             )
         }
     }
@@ -267,6 +334,7 @@ private struct CallsTabView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Calls")
+            .navigationBarTitleDisplayMode(.inline)
         }
     }
 }
@@ -285,6 +353,7 @@ private struct ChatsTabView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Chats")
+            .navigationBarTitleDisplayMode(.inline)
         }
     }
 }

@@ -86,6 +86,7 @@ struct SettingsView: View {
         }
         .listStyle(.insetGrouped)
         .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(.inline)
         .navigationDestination(for: SettingsDestination.self) { dest in
             SettingsDetail(destination: dest)
                 .environmentObject(store)
@@ -381,6 +382,12 @@ private struct StatusView: View {
             }
             Section {
                 NavigationLink {
+                    BlacklistView()
+                        .environmentObject(store)
+                } label: {
+                    Text("Blacklist")
+                }
+                NavigationLink {
                     AnnouncesView()
                         .environmentObject(store)
                 } label: {
@@ -401,6 +408,7 @@ private struct StatusView: View {
             }
         }
         .navigationTitle("Status")
+        .navigationBarTitleDisplayMode(.inline)
         .task {
             store.refreshInterfaceStats()
             store.refreshConfiguredInterfaces()
@@ -467,11 +475,71 @@ private struct AnnouncesView: View {
             }
         }
         .navigationTitle("Announces")
+        .navigationBarTitleDisplayMode(.inline)
         .task {
             store.refreshAnnounces()
         }
         .refreshable {
             store.refreshAnnounces()
+        }
+    }
+
+    private func timeString(from unix: Int64) -> String {
+        let date = Date(timeIntervalSince1970: TimeInterval(unix))
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .medium
+        return formatter.string(from: date)
+    }
+}
+
+private struct BlacklistView: View {
+    @EnvironmentObject private var store: AppStore
+
+    var body: some View {
+        List {
+            if store.blockedDestinations.isEmpty {
+                Text("No blocked destinations")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(store.blockedDestinations, id: \.self) { dest in
+                    let announce = store.announces.first(where: { $0.destinationHashHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == dest })
+                    let name = (announce?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+                        ? "Unknown"
+                        : (announce?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(name)
+                            .font(.headline)
+                        Text(dest)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        if let announce, announce.lastSeen > 0 {
+                            Text("Last seen \(timeString(from: announce.lastSeen))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                .onDelete(perform: delete)
+            }
+        }
+        .navigationTitle("Blacklist")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if !store.blockedDestinations.isEmpty {
+                ToolbarItem(placement: .topBarTrailing) {
+                    EditButton()
+                }
+            }
+        }
+    }
+
+    private func delete(at offsets: IndexSet) {
+        for index in offsets {
+            let dest = store.blockedDestinations[index]
+            store.unblockDestination(dest)
         }
     }
 
@@ -505,6 +573,7 @@ private struct LogsView: View {
             }
         }
         .navigationTitle("Logs")
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button("Copy All") {
@@ -539,6 +608,7 @@ private struct ConfigView: View {
         }
         .listStyle(.insetGrouped)
         .navigationTitle("Configurations")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
@@ -565,6 +635,7 @@ private struct ConfigEditorView: View {
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled(true)
             .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
                     if hasChanges {

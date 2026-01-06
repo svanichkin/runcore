@@ -28,6 +28,11 @@ final class AppStore: ObservableObject {
     @Published var lastAnnouncesJSON: String = ""
     @Published var lastAnnouncesError: String?
     @Published var debugLoggingEnabled: Bool = false
+    @Published var blockedDestinations: [String] = []
+    @Published var inboundPrompt: InboundPrompt?
+    @Published var inboundPromptAvatarData: Data?
+    @Published var inboundPromptAvatarHashHex: String?
+    @Published var inboundPromptIsLoadingAvatar: Bool = false
 
     private let persistence = Persistence()
     private let engine = RuncoreEngine()
@@ -35,6 +40,24 @@ final class AppStore: ObservableObject {
     private var statsPollTask: Task<Void, Never>?
     private var pendingRawLogLines: [String] = []
     private var rawLogFlushTask: Task<Void, Never>?
+    private var inboundPromptQueue: [InboundPrompt] = []
+    private var inboundAvatarTask: Task<Void, Never>?
+
+    struct InboundPrompt: Identifiable, Equatable {
+        let id: UUID
+        let destHashHex: String
+        let title: String
+        let content: String
+        let receivedAt: Date
+
+        init(destHashHex: String, title: String, content: String, receivedAt: Date = Date()) {
+            self.id = UUID()
+            self.destHashHex = destHashHex
+            self.title = title
+            self.content = content
+            self.receivedAt = receivedAt
+        }
+    }
 
     init() {
         load()
@@ -46,11 +69,21 @@ final class AppStore: ObservableObject {
         }
         engine.onInbound = { [weak self] destHex, title, content in
             guard let self else { return }
-            self.appendLog("inbound src=\(destHex) title=\(title)")
-            if let contact = self.contacts.first(where: { $0.destinationHashHex == destHex }) {
+            let dest = self.normalizeDestinationHashHex(destHex)
+            self.appendLog("inbound src=\(dest) title=\(title)")
+
+            if self.isBlockedDestination(dest) {
+                self.appendLog("inbound dropped (blocked) src=\(dest)")
+                return
+            }
+
+            if let contact = self.contacts.first(where: { $0.destinationHashHex == dest }) {
                 self.messagesByContactID[contact.id, default: []].append(ChatMessage(direction: .inbound, text: content, title: title))
                 self.save()
+                return
             }
+
+            self.enqueueInboundPrompt(InboundPrompt(destHashHex: dest, title: title, content: content))
         }
         engine.start()
         appendLog("engine started (iOS stub)")
@@ -471,6 +504,7 @@ final class AppStore: ObservableObject {
             profileName = snapshot.profileName ?? "Me"
             profileAvatarData = snapshot.profileAvatarData
             debugLoggingEnabled = snapshot.debugLoggingEnabled ?? false
+            blockedDestinations = snapshot.blockedDestinations ?? []
             selectedContactID = contacts.first?.id
         } catch {
             contacts = []
@@ -479,6 +513,7 @@ final class AppStore: ObservableObject {
             profileName = "Me"
             profileAvatarData = nil
             debugLoggingEnabled = false
+            blockedDestinations = []
         }
     }
 
@@ -489,7 +524,8 @@ final class AppStore: ObservableObject {
             logs: logs,
             profileName: profileName,
             profileAvatarData: profileAvatarData,
-            debugLoggingEnabled: debugLoggingEnabled
+            debugLoggingEnabled: debugLoggingEnabled,
+            blockedDestinations: blockedDestinations
         )
         try? persistence.save(snapshot)
     }
@@ -511,6 +547,134 @@ final class AppStore: ObservableObject {
     private func loadTextFile(at url: URL) -> String? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         return String(data: data, encoding: .utf8)
+    }
+
+    private func normalizeDestinationHashHex(_ s: String) -> String {
+        s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    func displayNameForDestinationHashHex(_ destHashHex: String) -> String {
+        let dest = normalizeDestinationHashHex(destHashHex)
+        if let contact = contacts.first(where: { $0.destinationHashHex == dest }) {
+            return contact.resolvedDisplayName
+        }
+        if let entry = announces.first(where: { normalizeDestinationHashHex($0.destinationHashHex) == dest }) {
+            let trimmed = entry.displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return "Unknown"
+    }
+
+    func isBlockedDestination(_ destHashHex: String) -> Bool {
+        let dest = normalizeDestinationHashHex(destHashHex)
+        return blockedDestinations.contains(dest)
+    }
+
+    func blockDestination(_ destHashHex: String) {
+        let dest = normalizeDestinationHashHex(destHashHex)
+        guard !dest.isEmpty else { return }
+        guard !blockedDestinations.contains(dest) else { return }
+        blockedDestinations.append(dest)
+        save()
+    }
+
+    func unblockDestination(_ destHashHex: String) {
+        let dest = normalizeDestinationHashHex(destHashHex)
+        blockedDestinations.removeAll(where: { $0 == dest })
+        save()
+    }
+
+    func acceptInboundPrompt(_ prompt: InboundPrompt) {
+        let dest = normalizeDestinationHashHex(prompt.destHashHex)
+        guard !dest.isEmpty else {
+            finishInboundPrompt()
+            return
+        }
+        if isBlockedDestination(dest) {
+            finishInboundPrompt()
+            return
+        }
+        let contactID: UUID
+        if let existing = contacts.first(where: { $0.destinationHashHex == dest }) {
+            contactID = existing.id
+        } else {
+            let initialName = displayNameForDestinationHashHex(dest)
+            let contact = Contact(
+                displayName: initialName == "Unknown" ? dest : initialName,
+                destinationHashHex: dest,
+                avatarHashHex: inboundPromptAvatarHashHex,
+                avatarPNGData: inboundPromptAvatarData
+            )
+            contacts.append(contact)
+            contactID = contact.id
+        }
+        if let idx = contacts.firstIndex(where: { $0.id == contactID }) {
+            if let inboundPromptAvatarData {
+                contacts[idx].avatarPNGData = inboundPromptAvatarData
+            }
+            if let inboundPromptAvatarHashHex {
+                contacts[idx].avatarHashHex = inboundPromptAvatarHashHex
+            }
+        }
+        messagesByContactID[contactID, default: []].append(ChatMessage(direction: .inbound, text: prompt.content, title: prompt.title))
+        selectedContactID = contactID
+        save()
+        finishInboundPrompt()
+    }
+
+    func declineInboundPrompt(_ prompt: InboundPrompt) {
+        appendLog("inbound declined src=\(prompt.destHashHex)")
+        finishInboundPrompt()
+    }
+
+    func blockInboundPrompt(_ prompt: InboundPrompt) {
+        blockDestination(prompt.destHashHex)
+        appendLog("inbound blocked src=\(prompt.destHashHex)")
+        finishInboundPrompt()
+    }
+
+    private func enqueueInboundPrompt(_ prompt: InboundPrompt) {
+        inboundPromptQueue.append(prompt)
+        if inboundPrompt == nil {
+            inboundPrompt = inboundPromptQueue.first
+            prefetchInboundPromptAvatarIfNeeded()
+        }
+    }
+
+    private func finishInboundPrompt() {
+        if !inboundPromptQueue.isEmpty {
+            inboundPromptQueue.removeFirst()
+        }
+        inboundPrompt = inboundPromptQueue.first
+        prefetchInboundPromptAvatarIfNeeded()
+    }
+
+    private func prefetchInboundPromptAvatarIfNeeded() {
+        inboundAvatarTask?.cancel()
+        inboundPromptAvatarData = nil
+        inboundPromptAvatarHashHex = nil
+        inboundPromptIsLoadingAvatar = false
+
+        guard let prompt = inboundPrompt else { return }
+        let promptID = prompt.id
+        let dest = normalizeDestinationHashHex(prompt.destHashHex)
+        guard !dest.isEmpty else { return }
+
+        inboundPromptIsLoadingAvatar = true
+        inboundAvatarTask = Task { @MainActor in
+            let preview = await resolveContactPreview(destHashHex: dest, timeoutMs: 20_000)
+            guard inboundPrompt?.id == promptID else { return }
+
+            if let avatar = preview?.avatarData, !avatar.isEmpty {
+                inboundPromptAvatarData = avatar
+            } else {
+                appendLog("inbound avatar preview empty for \(dest)")
+            }
+
+            let hash = preview?.avatarHashHex?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            inboundPromptAvatarHashHex = (hash?.isEmpty == false) ? hash : nil
+            inboundPromptIsLoadingAvatar = false
+        }
     }
 }
 
@@ -597,6 +761,7 @@ struct Snapshot: Codable {
     var profileName: String?
     var profileAvatarData: Data?
     var debugLoggingEnabled: Bool?
+    var blockedDestinations: [String]?
 }
 
 private struct Persistence {

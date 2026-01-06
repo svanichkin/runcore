@@ -11,6 +11,7 @@ struct AddContactView: View {
     let onCancel: () -> Void
     let onAdd: (_ displayName: String, _ destinationHashHex: String) -> Void
     let resolvePreview: ((_ destinationHashHex: String) async -> ContactPreview?)?
+    let announces: [AnnounceEntry]
 
     var body: some View {
         NavigationStack {
@@ -38,6 +39,7 @@ struct AddContactView: View {
                 }
             }
             .navigationTitle("Add Contact")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel", action: onCancel)
@@ -88,6 +90,8 @@ struct AddContactView: View {
         let dest = destinationHashHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard isValidDestinationHashHex(dest) else { return }
 
+        applyAnnouncedName(for: dest)
+
         resolveTask = Task { @MainActor in
             isResolvingName = true
             defer { isResolvingName = false }
@@ -118,6 +122,16 @@ struct AddContactView: View {
                 return false
             }
         }
+    }
+
+    private func applyAnnouncedName(for dest: String) {
+        guard resolvedName.isEmpty else { return }
+        guard let entry = announces.first(where: { $0.destinationHashHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == dest }) else {
+            return
+        }
+        let trimmed = entry.displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return }
+        resolvedName = trimmed
     }
 }
 
