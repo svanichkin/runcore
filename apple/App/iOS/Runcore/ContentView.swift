@@ -440,7 +440,7 @@ private struct ChatView: View {
 
             HStack(spacing: 8) {
                 TextField("Message", text: $draft, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
+                    .textFieldStyle(.plain)
                     .lineLimit(1...5)
 
                 Button("Send") {
@@ -572,30 +572,41 @@ private struct ProfileAvatarSizer: ViewModifier {
 
 private struct MessageRow: View {
     let message: ChatMessage
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        let isOutgoing = message.direction == .outbound
+        let maxBubbleWidth: CGFloat = (horizontalSizeClass == .regular) ? 520 : 280
+        let title = message.title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        HStack {
+            if isOutgoing { Spacer(minLength: 0) }
+
             VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Text(message.direction == .outbound ? "You" : "Them")
+                if !title.isEmpty && title.lowercased() != "msg" {
+                    Text(title)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(isOutgoing ? .white.opacity(0.85) : .secondary)
+                }
+
+                Text(message.text)
+                    .foregroundStyle(isOutgoing ? .white : .primary)
+                    .textSelection(.enabled)
+
+                HStack(spacing: 6) {
+                    Spacer(minLength: 0)
                     Text(message.timestamp, style: .time)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(isOutgoing ? .white.opacity(0.75) : .secondary)
                 }
-                if !message.title.isEmpty {
-                    Text(message.title)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Text(message.text)
-                    .textSelection(.enabled)
             }
-            Spacer(minLength: 0)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(isOutgoing ? Color.accentColor : Color.gray.opacity(0.14))
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .frame(maxWidth: maxBubbleWidth, alignment: .leading)
+
+            if !isOutgoing { Spacer(minLength: 0) }
         }
-        .padding(10)
-        .background(message.direction == .outbound ? Color.accentColor.opacity(0.08) : Color.gray.opacity(0.10))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 }
