@@ -24,11 +24,11 @@
 
 ## Screenshots
 
-| Chats | Image bubble (border + rounding) |
+| Chat with images | Add new contact |
 | --- | --- |
 | ![Chats](screenshots/screenshot_1.png) | ![Image bubble](screenshots/screenshot_2.png) |
 
-| Fullscreen preview | Diagnostics |
+| Setting status | Profile |
 | --- | --- |
 | ![Fullscreen preview](screenshots/screenshot_3.png) | ![Diagnostics](screenshots/screenshot_4.png) |
 
