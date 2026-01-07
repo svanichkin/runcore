@@ -40,7 +40,7 @@ build_ios_xcframework() {
 
   TMP="$IOS_OUTDIR/.tmp_ios"
   rm -rf "$TMP"
-  mkdir -p "$TMP/headers" "$TMP/ios" "$TMP/sim" "$TMP/catalyst_arm64" "$TMP/catalyst_amd64" "$TMP/catalyst"
+  mkdir -p "$TMP/headers" "$TMP/ios" "$TMP/sim_arm64" "$TMP/sim_amd64" "$TMP/sim" "$TMP/catalyst_arm64" "$TMP/catalyst_amd64" "$TMP/catalyst"
 
   echo "Building iOS (device) libruncore.a..."
   (
@@ -81,9 +81,26 @@ build_ios_xcframework() {
     export SDKROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)"
     export CGO_CFLAGS="-isysroot $SDKROOT -mios-simulator-version-min=16.0"
     export CGO_LDFLAGS="-isysroot $SDKROOT -mios-simulator-version-min=16.0"
-    go build -buildmode=c-archive -o "$TMP/sim/libruncore.a" ./ffi/runcorec
+    go build -buildmode=c-archive -o "$TMP/sim_arm64/libruncore.a" ./ffi/runcorec
   )
   # (intentionally no headers from libruncore.h; we use our stable C header)
+
+  echo "Building iOS (simulator x86_64) libruncore.a..."
+  (
+    cd "$ROOT"
+    export CGO_ENABLED=1
+    export GOOS=ios
+    export GOARCH=amd64
+    export CC="$(xcrun --sdk iphonesimulator --find clang)"
+    export CXX="$(xcrun --sdk iphonesimulator --find clang++)"
+    export SDKROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+    export CGO_CFLAGS="-isysroot $SDKROOT -mios-simulator-version-min=16.0 -target x86_64-apple-ios16.0-simulator"
+    export CGO_LDFLAGS="-isysroot $SDKROOT -mios-simulator-version-min=16.0 -target x86_64-apple-ios16.0-simulator"
+    go build -buildmode=c-archive -o "$TMP/sim_amd64/libruncore.a" ./ffi/runcorec
+  )
+
+  echo "Creating iOS Simulator universal libruncore.a (arm64+x86_64)..."
+  lipo -create     "$TMP/sim_arm64/libruncore.a"     "$TMP/sim_amd64/libruncore.a"     -output "$TMP/sim/libruncore.a"
 
   echo "Building Mac Catalyst (arm64) libruncore.a..."
   (
