@@ -3,15 +3,11 @@ package main
 /*
 #include <stdint.h>
  #include <stdlib.h>
-typedef void (*runcore_inbound_cb)(void* user_data, const char* src_hash_hex, const char* title, const char* content);
-typedef void (*runcore_inbound_cb2)(void* user_data, const char* src_hash_hex, const char* msg_id_hex, const char* title, const char* content);
+typedef void (*runcore_inbound_cb)(void* user_data, const char* src_hash_hex, const char* msg_id_hex, const char* title, const char* content);
 typedef void (*runcore_log_cb)(void* user_data, int32_t level, const char* line);
 typedef void (*runcore_message_status_cb)(void* user_data, const char* dest_hash_hex, const char* msg_id_hex, int32_t state);
 
-static inline void runcore_inbound_cb_call(runcore_inbound_cb cb, void* user_data, const char* src, const char* title, const char* content) {
-  cb(user_data, src, title, content);
-}
-static inline void runcore_inbound_cb2_call(runcore_inbound_cb2 cb, void* user_data, const char* src, const char* msg_id, const char* title, const char* content) {
+static inline void runcore_inbound_cb_call(runcore_inbound_cb cb, void* user_data, const char* src, const char* msg_id, const char* title, const char* content) {
   cb(user_data, src, msg_id, title, content);
 }
 static inline void runcore_log_cb_call(runcore_log_cb cb, void* user_data, int32_t level, const char* line) {
@@ -42,7 +38,6 @@ type nodeHandle struct {
 	node     *runcore.Node
 	destHex  *C.char
 	cb       C.runcore_inbound_cb
-	cb2      C.runcore_inbound_cb2
 	userData unsafe.Pointer
 	statusCB C.runcore_message_status_cb
 	statusUD unsafe.Pointer
@@ -119,10 +114,9 @@ func runcore_start(configDir *C.char, displayName *C.char, loglevel C.int32_t, r
 		}
 		h.mu.RLock()
 		cb := h.cb
-		cb2 := h.cb2
 		ud := h.userData
 		h.mu.RUnlock()
-		if cb == nil && cb2 == nil {
+		if cb == nil {
 			return
 		}
 		src := hex.EncodeToString(m.SourceHash)
@@ -134,11 +128,7 @@ func runcore_start(configDir *C.char, displayName *C.char, loglevel C.int32_t, r
 		cMsgID := allocCString(msgID)
 		cTitle := allocCString(m.TitleAsString())
 		cContent := allocCString(m.ContentAsString())
-		if cb2 != nil {
-			C.runcore_inbound_cb2_call(cb2, ud, cSrc, cMsgID, cTitle, cContent)
-		} else if cb != nil {
-			C.runcore_inbound_cb_call(cb, ud, cSrc, cTitle, cContent)
-		}
+		C.runcore_inbound_cb_call(cb, ud, cSrc, cMsgID, cTitle, cContent)
 		C.free(unsafe.Pointer(cSrc))
 		C.free(unsafe.Pointer(cMsgID))
 		C.free(unsafe.Pointer(cTitle))
@@ -186,18 +176,6 @@ func runcore_set_inbound_cb(handle C.uint64_t, cb C.runcore_inbound_cb, userData
 	}
 	h.mu.Lock()
 	h.cb = cb
-	h.userData = userData
-	h.mu.Unlock()
-}
-
-//export runcore_set_inbound_cb2
-func runcore_set_inbound_cb2(handle C.uint64_t, cb C.runcore_inbound_cb2, userData unsafe.Pointer) {
-	h := getHandle(handle)
-	if h == nil {
-		return
-	}
-	h.mu.Lock()
-	h.cb2 = cb
 	h.userData = userData
 	h.mu.Unlock()
 }

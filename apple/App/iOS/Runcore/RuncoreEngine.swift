@@ -78,7 +78,7 @@ final class RuncoreEngine {
         guard handle != 0 else { return }
         cachedDestHex = destinationHashHex()
 
-        runcore_set_inbound_cb2(handle, { userData, srcHash, msgID, title, content in
+        runcore_set_inbound_cb(handle, { userData, srcHash, msgID, title, content in
             guard let userData else { return }
             let engine = Unmanaged<RuncoreEngine>.fromOpaque(userData).takeUnretainedValue()
             let src = srcHash.map { String(cString: $0) } ?? ""

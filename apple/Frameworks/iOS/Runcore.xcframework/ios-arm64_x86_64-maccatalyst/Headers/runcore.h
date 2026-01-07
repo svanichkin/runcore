@@ -9,17 +9,9 @@ extern "C" {
 // Opaque handle to a running runcore node.
 typedef uint64_t runcore_handle_t;
 
-// Called on inbound message. All strings are UTF-8, valid only for the duration of the call.
-typedef void (*runcore_inbound_cb)(
-    void* user_data,
-    const char* src_hash_hex,
-    const char* title,
-    const char* content
-);
-
-// Called on inbound message (v2). Includes LXMF message_id (hex).
+// Called on inbound message. Includes LXMF message_id (hex).
 // All strings are UTF-8, valid only for the duration of the call.
-typedef void (*runcore_inbound_cb2)(
+typedef void (*runcore_inbound_cb)(
     void* user_data,
     const char* src_hash_hex,
     const char* msg_id_hex,
@@ -59,9 +51,6 @@ int32_t runcore_stop(runcore_handle_t handle);
 
 // Set inbound callback. Pass NULL to disable.
 void runcore_set_inbound_cb(runcore_handle_t handle, runcore_inbound_cb cb, void* user_data);
-
-// Set inbound callback (v2). Pass NULL to disable.
-void runcore_set_inbound_cb2(runcore_handle_t handle, runcore_inbound_cb2 cb, void* user_data);
 
 // Set outbound message status callback. Pass NULL to disable.
 void runcore_set_message_status_cb(runcore_handle_t handle, runcore_message_status_cb cb, void* user_data);
