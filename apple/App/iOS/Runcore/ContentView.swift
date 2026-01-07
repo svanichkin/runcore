@@ -631,80 +631,153 @@ private struct ProfileAvatarSizer: ViewModifier {
     }
 }
 
-private struct MessageRow: View {
-    let message: ChatMessage
-    let contactDestHashHex: String
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+	private struct MessageRow: View {
+	    let message: ChatMessage
+	    let contactDestHashHex: String
+	    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
-    var body: some View {
-        let isOutgoing = message.direction == .outbound
-        let maxBubbleWidth: CGFloat = (horizontalSizeClass == .regular) ? 520 : 280
-        let title = message.title.trimmingCharacters(in: .whitespacesAndNewlines)
+	    var body: some View {
+	        let isOutgoing = message.direction == .outbound
+	        let maxBubbleWidth: CGFloat = (horizontalSizeClass == .regular) ? 520 : 280
+	        let title = message.title.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        HStack {
-            if isOutgoing { Spacer(minLength: 0) }
+	        HStack {
+	            if isOutgoing { Spacer(minLength: 0) }
 
-            VStack(alignment: .leading, spacing: 4) {
-                if !title.isEmpty && title.lowercased() != "msg" && title.lowercased() != "img" {
-                    Text(title)
-                        .font(.caption)
-                        .foregroundStyle(isOutgoing ? .white.opacity(0.85) : .secondary)
-                }
+	            if let attachment = message.attachment {
+	                imageBubble(attachment: attachment, isOutgoing: isOutgoing, maxBubbleWidth: maxBubbleWidth)
+	            } else {
+	                textBubble(title: title, isOutgoing: isOutgoing, maxBubbleWidth: maxBubbleWidth)
+	            }
 
-                if let attachment = message.attachment {
-                    attachmentPreview(attachment, maxWidth: maxBubbleWidth)
-                }
+	            if !isOutgoing { Spacer(minLength: 0) }
+	        }
+	    }
 
-                if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || message.attachment == nil {
-                    Text(message.text)
-                        .foregroundStyle(isOutgoing ? .white : .primary)
-                        .textSelection(.enabled)
-                }
+	    @ViewBuilder
+	    private func textBubble(title: String, isOutgoing: Bool, maxBubbleWidth: CGFloat) -> some View {
+	        VStack(alignment: .leading, spacing: 4) {
+	            if !title.isEmpty && title.lowercased() != "msg" && title.lowercased() != "img" {
+	                Text(title)
+	                    .font(.caption)
+	                    .foregroundStyle(isOutgoing ? .white.opacity(0.85) : .secondary)
+	            }
 
-                HStack(spacing: 6) {
-                    Spacer(minLength: 0)
-                    Text(message.timestamp, style: .time)
-                        .font(.caption2)
-                        .foregroundStyle(isOutgoing ? .white.opacity(0.75) : .secondary)
-                    if isOutgoing {
-                        receiptMarks
-                    }
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .background(isOutgoing ? Color.accentColor : Color.gray.opacity(0.14))
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .frame(maxWidth: maxBubbleWidth, alignment: .leading)
+	            Text(message.text)
+	                .foregroundStyle(isOutgoing ? .white : .primary)
+	                .textSelection(.enabled)
 
-            if !isOutgoing { Spacer(minLength: 0) }
-        }
-    }
+	            HStack(spacing: 6) {
+	                Spacer(minLength: 0)
+	                Text(message.timestamp, style: .time)
+	                    .font(.caption2)
+	                    .foregroundStyle(isOutgoing ? .white.opacity(0.75) : .secondary)
+	                if isOutgoing {
+	                    receiptMarks
+	                }
+	            }
+	        }
+	        .padding(.horizontal, 12)
+	        .padding(.vertical, 9)
+	        .background(isOutgoing ? Color.accentColor : Color.gray.opacity(0.14))
+	        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+	        .frame(maxWidth: maxBubbleWidth, alignment: .leading)
+	    }
 
-    @ViewBuilder
-    private func attachmentPreview(_ attachment: MessageAttachment, maxWidth: CGFloat) -> some View {
-        let side: CGFloat = min(maxWidth, 240)
-        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+	    private func imageBubble(attachment: MessageAttachment, isOutgoing: Bool, maxBubbleWidth: CGFloat) -> some View {
+	        let maxSide: CGFloat = 240
+	        let maxW: CGFloat = min(maxBubbleWidth, maxSide)
+	        let maxH: CGFloat = maxSide
+	        let bubbleShape = RoundedRectangle(cornerRadius: 16, style: .continuous)
 
-        if let path = resolvedAttachmentPath(attachment),
-           let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-           let uiImage = UIImage(data: data) {
-            Image(uiImage: uiImage)
-                .resizable()
-                .scaledToFill()
-                .frame(width: side, height: side)
-                .clipped()
-                .clipShape(shape)
-        } else {
-            ZStack {
-                shape.fill(Color.gray.opacity(0.18))
-                Image(systemName: "photo")
-                    .font(.system(size: 22))
-                    .foregroundStyle(.secondary)
-            }
-            .frame(width: side, height: side)
-        }
-    }
+	        if let path = resolvedAttachmentPath(attachment),
+	           let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+	           let uiImage = UIImage(data: data) {
+	            let imgSize = uiImage.size
+	            let aspect = (imgSize.height > 0) ? (imgSize.width / imgSize.height) : 1
+	            let fitted = fittedAttachmentSize(imageSize: imgSize, maxW: maxW, maxH: maxH)
+
+	            return AnyView(
+	                ZStack(alignment: .bottomTrailing) {
+	                    Image(uiImage: uiImage)
+	                        .resizable()
+	                        .aspectRatio(aspect, contentMode: .fit)
+	                        .frame(width: fitted.width, height: fitted.height)
+
+	                    HStack(spacing: 6) {
+	                        Text(message.timestamp, style: .time)
+	                            .font(.caption2)
+	                            .foregroundStyle(.white.opacity(0.9))
+	                        if isOutgoing {
+	                            receiptMarks
+	                        }
+	                    }
+	                    .padding(.horizontal, 8)
+	                    .padding(.vertical, 6)
+	                    .background(.black.opacity(0.35))
+	                    .clipShape(Capsule())
+	                    .padding(8)
+	                }
+	                .frame(width: fitted.width, height: fitted.height, alignment: .bottomTrailing)
+	                .clipShape(bubbleShape)
+	            )
+	        }
+
+	        return AnyView(
+	            ZStack {
+	                bubbleShape.fill(Color.gray.opacity(0.18))
+	                Image(systemName: "photo")
+	                    .font(.system(size: 22))
+	                    .foregroundStyle(.secondary)
+	            }
+	            .frame(width: maxW, height: maxH)
+	        )
+	    }
+
+		    @ViewBuilder
+		    private func attachmentPreview(_ attachment: MessageAttachment, maxWidth: CGFloat) -> some View {
+		        let maxSide: CGFloat = 240
+		        let maxW: CGFloat = min(maxWidth, maxSide)
+		        let maxH: CGFloat = maxSide
+	        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+
+	        if let path = resolvedAttachmentPath(attachment),
+	           let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+	           let uiImage = UIImage(data: data) {
+	            let imgSize = uiImage.size
+	            let aspect = (imgSize.height > 0) ? (imgSize.width / imgSize.height) : 1
+	            let fitted = fittedAttachmentSize(imageSize: imgSize, maxW: maxW, maxH: maxH)
+
+	            Image(uiImage: uiImage)
+	                .resizable()
+	                .aspectRatio(aspect, contentMode: .fit)
+	                .frame(width: fitted.width, height: fitted.height)
+	                .clipShape(shape)
+	        } else {
+	            ZStack {
+	                shape.fill(Color.gray.opacity(0.18))
+	                Image(systemName: "photo")
+	                    .font(.system(size: 22))
+	                    .foregroundStyle(.secondary)
+	            }
+	            .frame(width: maxW, height: maxH)
+	        }
+	    }
+
+	    private func fittedAttachmentSize(imageSize: CGSize, maxW: CGFloat, maxH: CGFloat) -> CGSize {
+	        let aspect = (imageSize.height > 0) ? (imageSize.width / imageSize.height) : 1
+	        let safeAspect = max(aspect, 0.01)
+	        var width = maxW
+	        var height = width / safeAspect
+	        if height > maxH {
+	            height = maxH
+	            width = height * safeAspect
+	        }
+	        // Avoid tiny bubbles for very narrow images.
+	        width = max(120, min(width, maxW))
+	        height = max(120, min(height, maxH))
+	        return CGSize(width: width, height: height)
+	    }
 
     private func resolvedAttachmentPath(_ attachment: MessageAttachment) -> String? {
         let fm = FileManager.default
