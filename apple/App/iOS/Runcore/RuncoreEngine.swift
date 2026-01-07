@@ -30,19 +30,64 @@ final class RuncoreEngine {
 
     struct ContactAvatarResponse: Decodable {
         let hashHex: String?
+        let dataBase64: String?
         let pngBase64: String?
+        let mime: String?
         let unchanged: Bool?
         let notPresent: Bool?
         let error: String?
 
         enum CodingKeys: String, CodingKey {
             case hashHex = "hash_hex"
+            case dataBase64 = "data_base64"
             case pngBase64 = "png_base64"
+            case mime
             case unchanged
             case notPresent = "not_present"
             case error
         }
     }
+
+    struct StoreAttachmentResponse: Decodable {
+        let rc: Int32
+        let hashHex: String?
+        let mime: String?
+        let name: String?
+        let size: Int?
+        let updated: Int64?
+        let error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case rc
+            case hashHex = "hash_hex"
+            case mime
+            case name
+            case size
+            case updated
+            case error
+        }
+    }
+
+    struct ContactAttachmentResponse: Decodable {
+        let hashHex: String?
+        let path: String?
+        let mime: String?
+        let name: String?
+        let size: Int?
+        let notPresent: Bool?
+        let error: String?
+
+        enum CodingKeys: String, CodingKey {
+            case hashHex = "hash_hex"
+            case path
+            case mime
+            case name
+            case size
+            case notPresent = "not_present"
+            case error
+        }
+    }
+
 
     struct SendResult: Decodable {
         let rc: Int32
@@ -99,14 +144,19 @@ final class RuncoreEngine {
                 engine.onMessageStatus?(dest, mid, state)
             }
         }, Unmanaged.passUnretained(self).toOpaque())
-
-        _ = runcore_announce(handle)
     }
 
     func stop() {
         guard handle != 0 else { return }
         _ = runcore_stop(handle)
         handle = 0
+    }
+
+    func announce(reason: String = "ffi") -> Int32 {
+        guard handle != 0 else { return 1 }
+        return reason.withCString { cReason in
+            runcore_announce_with_reason(handle, cReason)
+        }
     }
 
     func setLogLevel(_ level: Int32) {
@@ -172,6 +222,45 @@ final class RuncoreEngine {
         }
     }
 
+    private func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
+        if let s {
+            return s.withCString { body($0) }
+        }
+        return body(nil)
+    }
+
+    func storeAttachment(mime: String?, name: String?, data: Data) -> StoreAttachmentResponse? {
+        guard handle != 0 else { return nil }
+        guard !data.isEmpty else { return StoreAttachmentResponse(rc: 2, hashHex: nil, mime: nil, name: nil, size: nil, updated: nil, error: "empty data") }
+        let jsonPtr: UnsafeMutablePointer<CChar>? = data.withUnsafeBytes { buf in
+            guard let base = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return nil }
+            return withOptionalCString(mime) { cMime in
+                withOptionalCString(name) { cName in
+                    runcore_store_attachment_json(handle, cMime, cName, base, Int32(buf.count))
+                }
+            }
+        }
+        guard let jsonPtr else { return nil }
+        defer { runcore_free_string(jsonPtr) }
+        let json = String(cString: jsonPtr)
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(StoreAttachmentResponse.self, from: data)
+    }
+
+    func contactAttachment(destHashHex: String, attachmentHashHex: String, timeoutMs: Int32 = 15000) -> ContactAttachmentResponse? {
+        guard handle != 0 else { return nil }
+        return destHashHex.withCString { cDest in
+            attachmentHashHex.withCString { cHash in
+                guard let ptr = runcore_contact_attachment_json(handle, cDest, cHash, timeoutMs) else { return nil }
+                defer { runcore_free_string(ptr) }
+                let json = String(cString: ptr)
+                guard let data = json.data(using: .utf8) else { return nil }
+                return try? JSONDecoder().decode(ContactAttachmentResponse.self, from: data)
+            }
+        }
+    }
+
+
     func setInterfaceEnabled(name: String, enabled: Bool) -> Int32 {
         guard handle != 0 else { return 1 }
         return name.withCString { cName in
@@ -217,21 +306,31 @@ final class RuncoreEngine {
         return (try? JSONDecoder().decode(SendResult.self, from: data)) ?? SendResult(rc: 2, messageIDHex: nil, error: "decode failed")
     }
 
-    func setAvatarPNG(_ data: Data) -> Int32 {
+        func setAvatarImage(mime: String, data: Data) -> Int32 {
+        guard handle != 0 else { return 1 }
+        return data.withUnsafeBytes { buf in
+            guard let base = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return 2 }
+            return mime.withCString { cMime in
+                runcore_set_avatar_image(handle, cMime, base, Int32(buf.count))
+            }
+        }
+    }
+
+func setAvatarPNG(_ data: Data) -> Int32 {
         guard handle != 0 else { return 1 }
         guard !data.isEmpty else { return 2 }
         let rc: Int32 = data.withUnsafeBytes { buf in
             guard let base = buf.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return 2 }
             return runcore_set_avatar_png(handle, base, Int32(buf.count))
         }
-        if rc == 0 { _ = runcore_announce(handle) }
+        if rc == 0 { _ = announce(reason: "avatar_changed") }
         return rc
     }
 
     func clearAvatar() -> Int32 {
         guard handle != 0 else { return 1 }
         let rc = runcore_clear_avatar(handle)
-        if rc == 0 { _ = runcore_announce(handle) }
+        if rc == 0 { _ = announce(reason: "avatar_cleared") }
         return rc
     }
 
@@ -241,7 +340,7 @@ final class RuncoreEngine {
         name.withCString { cName in
             _ = runcore_set_display_name(handle, cName)
         }
-        _ = runcore_announce(handle)
+        _ = announce(reason: "display_name_changed")
     }
 
     func setDisplayName(_ name: String) {

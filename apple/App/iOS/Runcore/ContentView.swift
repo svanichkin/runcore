@@ -1,19 +1,19 @@
 import SwiftUI
 import UIKit
 import PhotosUI
+import UniformTypeIdentifiers
 
 private enum ContactsRoute: Hashable {
     case chat(UUID)
 }
 
 struct ContentView: View {
-    @StateObject private var store = AppStore()
+    @EnvironmentObject private var store: AppStore
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     var body: some View {
         TabView {
             ContactsTabView()
-                .environmentObject(store)
                 .tabItem { Label("Contacts", systemImage: "person.2") }
 
             CallsTabView()
@@ -23,7 +23,6 @@ struct ContentView: View {
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right") }
 
             SettingsTabView()
-                .environmentObject(store)
                 .tabItem { Label("Settings", systemImage: "gearshape") }
         }
         .toolbar(removing: .sidebarToggle)
@@ -32,7 +31,6 @@ struct ContentView: View {
             item: Binding(get: { store.inboundPrompt }, set: { _ in }),
             content: { prompt in
                 InboundPromptSheet(prompt: prompt)
-                    .environmentObject(store)
                     .interactiveDismissDisabled()
             }
         )
@@ -373,6 +371,12 @@ private struct ChatView: View {
 
     @State private var draft = ""
 
+    @State private var isImportingAttachment = false
+    @State private var importingAttachmentError: String?
+    #if !targetEnvironment(macCatalyst)
+    @State private var pickedAttachmentItem: PhotosPickerItem?
+    #endif
+
     private var contact: Contact? {
         store.contacts.first(where: { $0.id == contactID })
     }
@@ -416,13 +420,62 @@ private struct ChatView: View {
         }
     }
 
+
+
+    @ViewBuilder
+    private var attachmentPicker: some View {
+        #if targetEnvironment(macCatalyst)
+        Button {
+            importingAttachmentError = nil
+            isImportingAttachment = true
+        } label: {
+            Image(systemName: "photo")
+                .font(.system(size: 18))
+                .frame(width: 32, height: 32)
+        }
+        .buttonStyle(.plain)
+        .fileImporter(
+            isPresented: $isImportingAttachment,
+            allowedContentTypes: [UTType.image],
+            allowsMultipleSelection: false
+        ) { result in
+            do {
+                guard let url = try result.get().first else { return }
+                let data = try Data(contentsOf: url)
+                let caption = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                store.sendImageAttachment(to: contactID, data: data, suggestedName: url.lastPathComponent, caption: caption)
+                draft = ""
+            } catch {
+                importingAttachmentError = String(describing: error)
+            }
+        }
+        #else
+        PhotosPicker(selection: $pickedAttachmentItem, matching: .images) {
+            Image(systemName: "photo")
+                .font(.system(size: 18))
+                .frame(width: 32, height: 32)
+        }
+        .buttonStyle(.plain)
+        .onChange(of: pickedAttachmentItem) { newItem in
+            guard let newItem else { return }
+            Task { @MainActor in
+                defer { pickedAttachmentItem = nil }
+                if let data = try? await newItem.loadTransferable(type: Data.self) {
+                    let caption = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+                    store.sendImageAttachment(to: contactID, data: data, suggestedName: nil, caption: caption)
+                    draft = ""
+                }
+            }
+        }
+        #endif
+    }
     private var chatBody: some View {
         VStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         ForEach(store.messages(for: contactID)) { msg in
-                            MessageRow(message: msg)
+                            MessageRow(message: msg, contactDestHashHex: contact?.destinationHashHex ?? "")
                                 .id(msg.id)
                         }
                     }
@@ -442,6 +495,8 @@ private struct ChatView: View {
             Divider()
 
             HStack(spacing: 8) {
+                attachmentPicker
+
                 TextField("Message", text: $draft, axis: .vertical)
                     .textFieldStyle(.plain)
                     .lineLimit(1...5)
@@ -578,6 +633,7 @@ private struct ProfileAvatarSizer: ViewModifier {
 
 private struct MessageRow: View {
     let message: ChatMessage
+    let contactDestHashHex: String
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     var body: some View {
@@ -589,15 +645,21 @@ private struct MessageRow: View {
             if isOutgoing { Spacer(minLength: 0) }
 
             VStack(alignment: .leading, spacing: 4) {
-                if !title.isEmpty && title.lowercased() != "msg" {
+                if !title.isEmpty && title.lowercased() != "msg" && title.lowercased() != "img" {
                     Text(title)
                         .font(.caption)
                         .foregroundStyle(isOutgoing ? .white.opacity(0.85) : .secondary)
                 }
 
-                Text(message.text)
-                    .foregroundStyle(isOutgoing ? .white : .primary)
-                    .textSelection(.enabled)
+                if let attachment = message.attachment {
+                    attachmentPreview(attachment, maxWidth: maxBubbleWidth)
+                }
+
+                if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || message.attachment == nil {
+                    Text(message.text)
+                        .foregroundStyle(isOutgoing ? .white : .primary)
+                        .textSelection(.enabled)
+                }
 
                 HStack(spacing: 6) {
                     Spacer(minLength: 0)
@@ -616,6 +678,58 @@ private struct MessageRow: View {
             .frame(maxWidth: maxBubbleWidth, alignment: .leading)
 
             if !isOutgoing { Spacer(minLength: 0) }
+        }
+    }
+
+    @ViewBuilder
+    private func attachmentPreview(_ attachment: MessageAttachment, maxWidth: CGFloat) -> some View {
+        let side: CGFloat = min(maxWidth, 240)
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+
+        if let path = resolvedAttachmentPath(attachment),
+           let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+           let uiImage = UIImage(data: data) {
+            Image(uiImage: uiImage)
+                .resizable()
+                .scaledToFill()
+                .frame(width: side, height: side)
+                .clipped()
+                .clipShape(shape)
+        } else {
+            ZStack {
+                shape.fill(Color.gray.opacity(0.18))
+                Image(systemName: "photo")
+                    .font(.system(size: 22))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(width: side, height: side)
+        }
+    }
+
+    private func resolvedAttachmentPath(_ attachment: MessageAttachment) -> String? {
+        let fm = FileManager.default
+        if let p = attachment.localPath, !p.isEmpty, fm.fileExists(atPath: p) {
+            return p
+        }
+        let hash = attachment.hashHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !hash.isEmpty else { return nil }
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let base = appSupport.appendingPathComponent("Runcore", isDirectory: true)
+
+        switch message.direction {
+        case .outbound:
+            return base.appendingPathComponent("attachments", isDirectory: true)
+                .appendingPathComponent("out", isDirectory: true)
+                .appendingPathComponent("\(hash).bin")
+                .path
+        case .inbound:
+            let remote = contactDestHashHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !remote.isEmpty else { return nil }
+            return base.appendingPathComponent("attachments", isDirectory: true)
+                .appendingPathComponent("in", isDirectory: true)
+                .appendingPathComponent(remote, isDirectory: true)
+                .appendingPathComponent("\(hash).bin")
+                .path
         }
     }
 

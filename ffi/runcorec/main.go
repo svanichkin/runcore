@@ -246,8 +246,8 @@ func runcore_send(handle C.uint64_t, destHashHex *C.char, title *C.char, content
 		return 4
 	}
 	if !rns.TransportHasPath(destHash) {
+		// Do not fail fast: queue opportunistic send and let Reticulum establish a path.
 		rns.TransportRequestPath(destHash)
-		return 5
 	}
 	if !strings.EqualFold(dest, C.GoString(h.destHex)) && rns.IdentityRecall(destHash) == nil {
 		rns.TransportRequestPath(destHash)
@@ -276,10 +276,11 @@ func runcore_send_result_json(handle C.uint64_t, destHashHex *C.char, title *C.c
 		b, _ := json.Marshal(map[string]any{"rc": 5, "error": "invalid destination hash"})
 		return allocCString(string(b))
 	}
+	pathPending := false
 	if !rns.TransportHasPath(destHash) {
+		// Do not fail fast: queue opportunistic send and let Reticulum establish a path.
+		pathPending = true
 		rns.TransportRequestPath(destHash)
-		b, _ := json.Marshal(map[string]any{"rc": 4, "error": "no path to destination"})
-		return allocCString(string(b))
 	}
 	if !strings.EqualFold(dest, C.GoString(h.destHex)) && rns.IdentityRecall(destHash) == nil {
 		rns.TransportRequestPath(destHash)
@@ -347,6 +348,9 @@ func runcore_send_result_json(handle C.uint64_t, destHashHex *C.char, title *C.c
 		msgIDHex = hex.EncodeToString(msg.Hash)
 	}
 	resp := map[string]any{"rc": 0, "message_id_hex": msgIDHex}
+	if pathPending {
+		resp["path_pending"] = true
+	}
 	b, _ := json.Marshal(resp)
 	return allocCString(string(b))
 }
@@ -357,7 +361,24 @@ func runcore_announce(handle C.uint64_t) C.int32_t {
 	if h == nil || h.node == nil {
 		return 1
 	}
-	h.node.AnnounceDelivery()
+	h.node.AnnounceDeliveryWithReason("ffi")
+	return 0
+}
+
+//export runcore_announce_with_reason
+func runcore_announce_with_reason(handle C.uint64_t, reason *C.char) C.int32_t {
+	h := getHandle(handle)
+	if h == nil || h.node == nil {
+		return 1
+	}
+	r := ""
+	if reason != nil {
+		r = C.GoString(reason)
+	}
+	if strings.TrimSpace(r) == "" {
+		r = "ffi"
+	}
+	h.node.AnnounceDeliveryWithReason(r)
 	return 0
 }
 
@@ -451,7 +472,7 @@ func runcore_contact_avatar_json(handle C.uint64_t, destHashHex *C.char, knownAv
 		known = C.GoString(knownAvatarHashHex)
 	}
 	timeout := time.Duration(timeoutMs) * time.Millisecond
-	av, err := h.node.ContactAvatarPNGBase64Hex(C.GoString(destHashHex), known, timeout)
+	av, err := h.node.ContactAvatarDataBase64Hex(C.GoString(destHashHex), known, timeout)
 	resp := map[string]any{
 		"hash_hex":    av.HashHex,
 		"png_base64":  av.PNGBase64,
@@ -464,6 +485,64 @@ func runcore_contact_avatar_json(handle C.uint64_t, destHashHex *C.char, knownAv
 	}
 	b, _ := json.Marshal(resp)
 	return allocCString(string(b))
+}
+
+//export runcore_store_attachment_json
+func runcore_store_attachment_json(handle C.uint64_t, mime *C.char, name *C.char, data *C.uchar, dataLen C.int32_t) *C.char {
+	h := getHandle(handle)
+	if h == nil || h.node == nil {
+		return allocCString(`{"rc":1,"error":"node not started"}`)
+	}
+	if data == nil || dataLen <= 0 {
+		return allocCString(`{"rc":2,"error":"empty attachment"}`)
+	}
+	m := ""
+	if mime != nil {
+		m = C.GoString(mime)
+	}
+	n := ""
+	if name != nil {
+		n = C.GoString(name)
+	}
+	b := C.GoBytes(unsafe.Pointer(data), C.int(dataLen))
+	info, err := h.node.StoreOutgoingAttachment(b, m, n)
+	resp := map[string]any{
+		"rc":       0,
+		"hash_hex": info.HashHex,
+		"mime":     info.Mime,
+		"name":     info.Name,
+		"size":     info.Size,
+		"updated":  info.Updated,
+	}
+	if err != nil {
+		resp["rc"] = 3
+		resp["error"] = err.Error()
+	}
+	jb, _ := json.Marshal(resp)
+	return allocCString(string(jb))
+}
+
+//export runcore_contact_attachment_json
+func runcore_contact_attachment_json(handle C.uint64_t, destHashHex *C.char, attachmentHashHex *C.char, timeoutMs C.int32_t) *C.char {
+	h := getHandle(handle)
+	if h == nil || h.node == nil || destHashHex == nil || attachmentHashHex == nil {
+		return nil
+	}
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+	fetch, err := h.node.ContactAttachmentPathHex(C.GoString(destHashHex), C.GoString(attachmentHashHex), timeout)
+	resp := map[string]any{
+		"hash_hex":    fetch.HashHex,
+		"path":        fetch.Path,
+		"mime":        fetch.Mime,
+		"name":        fetch.Name,
+		"size":        fetch.Size,
+		"not_present": fetch.NotPresent,
+	}
+	if err != nil {
+		resp["error"] = err.Error()
+	}
+	jb, _ := json.Marshal(resp)
+	return allocCString(string(jb))
 }
 
 //export runcore_set_avatar_png
@@ -481,6 +560,29 @@ func runcore_set_avatar_png(handle C.uint64_t, pngData *C.uchar, pngLen C.int32_
 	}
 	return 0
 }
+
+//export runcore_set_avatar_image
+func runcore_set_avatar_image(handle C.uint64_t, mime *C.char, data *C.uchar, dataLen C.int32_t) C.int32_t {
+	h := getHandle(handle)
+	if h == nil || h.node == nil {
+		return 1
+	}
+	if data == nil || dataLen <= 0 {
+		return 2
+	}
+	b := C.GoBytes(unsafe.Pointer(data), C.int(dataLen))
+	mt := ""
+	if mime != nil {
+		mt = C.GoString(mime)
+	}
+	if err := h.node.SetAvatarImage(mt, b); err != nil {
+		rns.Logf(rns.LOG_NOTICE, "set avatar image failed: %v", err)
+		return 3
+	}
+	h.node.AnnounceDeliveryWithReason("avatar_changed")
+	return 0
+}
+
 
 //export runcore_clear_avatar
 func runcore_clear_avatar(handle C.uint64_t) C.int32_t {

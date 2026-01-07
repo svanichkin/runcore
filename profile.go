@@ -34,9 +34,15 @@ func (n *Node) initProfileDestination() error {
 	if err := n.registerAvatarRequestHandler(dest); err != nil {
 		return fmt.Errorf("register avatar handler on profile dest: %w", err)
 	}
+	if err := n.registerAttachmentRequestHandler(dest); err != nil {
+		return fmt.Errorf("register attachment handler on profile dest: %w", err)
+	}
 	n.profileDestIn = dest
 	if err := n.registerAvatarRequestHandler(n.deliveryDestIn); err != nil {
 		return fmt.Errorf("register avatar handler on delivery dest: %w", err)
+	}
+	if err := n.registerAttachmentRequestHandler(n.deliveryDestIn); err != nil {
+		return fmt.Errorf("register attachment handler on delivery dest: %w", err)
 	}
 	return nil
 }
@@ -47,7 +53,7 @@ func (n *Node) registerAvatarRequestHandler(dest *rns.Destination) error {
 	}
 	return dest.RegisterRequestHandler(
 		profileAvatarReq,
-		func(path string, data any, requestID []byte, linkID []byte, remoteIdentity *rns.Identity, requestedAt time.Time) any {
+		func(path string, reqData any, requestID []byte, linkID []byte, remoteIdentity *rns.Identity, requestedAt time.Time) any {
 			if n == nil {
 				return nil
 			}
@@ -56,7 +62,7 @@ func (n *Node) registerAvatarRequestHandler(dest *rns.Destination) error {
 				remoteHex = remoteIdentity.HexHash
 			}
 			var knownHash []byte
-			if m, ok := data.(map[any]any); ok {
+			if m, ok := reqData.(map[any]any); ok {
 				if hv, ok := m["h"]; ok {
 					if b, ok := hv.([]byte); ok && len(b) > 0 {
 						knownHash = b
@@ -65,20 +71,20 @@ func (n *Node) registerAvatarRequestHandler(dest *rns.Destination) error {
 			}
 
 			hash := append([]byte(nil), n.avatarHash...)
-			png := append([]byte(nil), n.avatarPNG...)
+			avatarData := append([]byte(nil), n.avatarPNG...)
 			mtime := n.avatarMTime
 			mime := n.avatarMime
 			if mime == "" {
-				mime = "image/png"
+				mime = detectAvatarMime(avatarData)
 			}
 
-			if len(hash) == 0 || len(png) == 0 {
+			if len(hash) == 0 || len(avatarData) == 0 {
 				rns.Logf(rns.LOG_NOTICE, "avatar req: none available remote=%s", remoteHex)
 				return map[any]any{"ok": false}
 			}
 			if len(knownHash) > 0 && bytes.Equal(knownHash, hash) {
-				rns.Logf(rns.LOG_NOTICE, "avatar req: unchanged remote=%s size=%d", remoteHex, len(png))
-				return map[any]any{"ok": true, "unchanged": true, "h": hash, "t": mime, "s": len(png), "u": mtime}
+				rns.Logf(rns.LOG_NOTICE, "avatar req: unchanged remote=%s size=%d", remoteHex, len(avatarData))
+				return map[any]any{"ok": true, "unchanged": true, "h": hash, "t": mime, "s": len(avatarData), "u": mtime}
 			}
 			link := findActiveLink(linkID)
 			if link == nil {
@@ -89,15 +95,15 @@ func (n *Node) registerAvatarRequestHandler(dest *rns.Destination) error {
 				"kind": profileAvatarRes,
 				"h":    hash,
 				"t":    mime,
-				"s":    len(png),
+				"s":    len(avatarData),
 				"u":    mtime,
 			}
-			if _, err := rns.NewResource(png, nil, link, meta, true, false, nil, nil, nil, 0, nil, nil, false, 0); err != nil {
+			if _, err := rns.NewResource(avatarData, nil, link, meta, true, false, nil, nil, nil, 0, nil, nil, false, 0); err != nil {
 				rns.Logf(rns.LOG_NOTICE, "avatar req: resource send failed remote=%s err=%v", remoteHex, err)
 				return map[any]any{"ok": false, "error": "resource send failed"}
 			}
-			rns.Logf(rns.LOG_NOTICE, "avatar req: resource queued remote=%s size=%d", remoteHex, len(png))
-			return map[any]any{"ok": true, "h": hash, "t": mime, "s": len(png), "u": mtime, "resource": true}
+			rns.Logf(rns.LOG_NOTICE, "avatar req: resource queued remote=%s size=%d", remoteHex, len(avatarData))
+			return map[any]any{"ok": true, "h": hash, "t": mime, "s": len(avatarData), "u": mtime, "resource": true}
 		},
 		rns.DestinationALLOW_ALL,
 		nil,
@@ -107,13 +113,15 @@ func (n *Node) registerAvatarRequestHandler(dest *rns.Destination) error {
 
 type ContactAvatarFetch struct {
 	HashHex    string `json:"hash_hex,omitempty"`
+	DataBase64 string `json:"data_base64,omitempty"`
 	PNGBase64  string `json:"png_base64,omitempty"`
 	Mime       string `json:"mime,omitempty"`
 	Unchanged  bool   `json:"unchanged,omitempty"`
 	NotPresent bool   `json:"not_present,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
-func (n *Node) ContactAvatarPNGBase64Hex(destinationHashHex string, knownAvatarHashHex string, timeout time.Duration) (ContactAvatarFetch, error) {
+func (n *Node) ContactAvatarDataBase64Hex(destinationHashHex string, knownAvatarHashHex string, timeout time.Duration) (ContactAvatarFetch, error) {
 	if n == nil || n.identity == nil {
 		return ContactAvatarFetch{}, errors.New("node not started")
 	}
@@ -160,6 +168,20 @@ func (n *Node) ContactAvatarPNGBase64Hex(destinationHashHex string, knownAvatarH
 func (n *Node) fetchAvatarViaDestination(outDest *rns.Destination, knownAvatarHashHex string, timeout time.Duration) (ContactAvatarFetch, error) {
 	if outDest == nil {
 		return ContactAvatarFetch{}, errors.New("nil destination")
+	}
+
+	// If we don't have a path yet, link establishment will usually just time out.
+	// This is common on macCatalyst when multicast announce reception is flaky.
+	if !rns.TransportHasPath(outDest.Hash()) {
+		rns.Logf(rns.LOG_NOTICE, "avatar fetch: no path yet, requesting path dest=%s", hex.EncodeToString(outDest.Hash()))
+		rns.TransportRequestPath(outDest.Hash())
+		waitDeadline := time.Now().Add(minDuration(timeout, 4*time.Second))
+		for !rns.TransportHasPath(outDest.Hash()) && time.Now().Before(waitDeadline) {
+			time.Sleep(150 * time.Millisecond)
+		}
+		if rns.TransportHasPath(outDest.Hash()) {
+			rns.Logf(rns.LOG_NOTICE, "avatar fetch: path acquired dest=%s", hex.EncodeToString(outDest.Hash()))
+		}
 	}
 
 	established := make(chan struct{})
@@ -261,7 +283,8 @@ func (n *Node) fetchAvatarViaDestination(outDest *rns.Destination, knownAvatarHa
 			case []byte:
 				// Compatibility: handler may return raw bytes.
 				rns.Logf(rns.LOG_NOTICE, "avatar fetch: ok raw size=%d", len(v))
-				return ContactAvatarFetch{PNGBase64: base64.StdEncoding.EncodeToString(v)}, nil
+				b64 := base64.StdEncoding.EncodeToString(v)
+				return ContactAvatarFetch{DataBase64: b64, PNGBase64: b64}, nil
 			default:
 				rns.Logf(rns.LOG_NOTICE, "avatar fetch: unexpected response %T", resp)
 				return ContactAvatarFetch{}, errors.New("unexpected avatar response type")
@@ -294,7 +317,9 @@ func (n *Node) fetchAvatarViaDestination(outDest *rns.Destination, knownAvatarHa
 				Unchanged: false,
 			}
 			if len(data) > 0 {
-				out.PNGBase64 = base64.StdEncoding.EncodeToString(data)
+				b64 := base64.StdEncoding.EncodeToString(data)
+				out.DataBase64 = b64
+				out.PNGBase64 = b64
 			}
 			rns.Logf(rns.LOG_NOTICE, "avatar fetch: ok resource size=%d", len(data))
 			return out, nil
@@ -306,6 +331,16 @@ func (n *Node) fetchAvatarViaDestination(outDest *rns.Destination, knownAvatarHa
 			return ContactAvatarFetch{}, errors.New("avatar request timeout")
 		}
 	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a <= 0 {
+		return b
+	}
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func findActiveLink(linkID []byte) *rns.Link {

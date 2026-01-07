@@ -70,6 +70,11 @@ char* runcore_send_result_json(runcore_handle_t handle, const char* dest_hash_he
 // Announce this node's delivery destination. Returns 0 on success.
 int32_t runcore_announce(runcore_handle_t handle);
 
+// Announce this node's delivery destination with a reason string (for logging).
+// `reason` may be NULL/empty.
+// Returns 0 on success.
+int32_t runcore_announce_with_reason(runcore_handle_t handle, const char* reason);
+
 // Update display_name used in announce app-data (does not restart the node). Returns 0 on success.
 int32_t runcore_set_display_name(runcore_handle_t handle, const char* display_name);
 
@@ -78,6 +83,9 @@ int32_t runcore_restart(runcore_handle_t handle);
 
 // Set profile avatar PNG bytes (announced via app-data + available over /avatar). Returns 0 on success.
 int32_t runcore_set_avatar_png(runcore_handle_t handle, const unsigned char* png_data, int32_t png_len);
+
+// Set profile avatar bytes with explicit mime (eg. "image/heic").
+int32_t runcore_set_avatar_image(runcore_handle_t handle, const char* mime, const unsigned char* data, int32_t data_len);
 
 // Clear profile avatar. Returns 0 on success.
 int32_t runcore_clear_avatar(runcore_handle_t handle);
@@ -120,6 +128,17 @@ char* runcore_contact_info_json(runcore_handle_t handle, const char* dest_hash_h
 // Response: {"hash_hex":"..","png_base64":"..","unchanged":bool,"not_present":bool,"error":".."}.
 // The returned pointer must be freed with runcore_free_string().
 char* runcore_contact_avatar_json(runcore_handle_t handle, const char* dest_hash_hex, const char* known_avatar_hash_hex, int32_t timeout_ms);
+
+// Store an outgoing attachment payload on disk and return JSON with hash_hex.
+// Response: {"rc":0,"hash_hex":"..","mime":"..","name":"..","size":123,"updated":1700000000,"error":".."}.
+// The returned pointer must be freed with runcore_free_string().
+char* runcore_store_attachment_json(runcore_handle_t handle, const char* mime, const char* name, const unsigned char* data, int32_t data_len);
+
+// Fetch an attachment payload from a contact over Reticulum resource transfer.
+// Response: {"hash_hex":"..","path":"/abs/path","mime":"..","name":"..","size":123,"not_present":bool,"error":".."}.
+// The returned pointer must be freed with runcore_free_string().
+char* runcore_contact_attachment_json(runcore_handle_t handle, const char* dest_hash_hex, const char* attachment_hash_hex, int32_t timeout_ms);
+
 
 // Enable/disable an interface by config section name (eg "Default Interface").
 // Returns 0 on success.

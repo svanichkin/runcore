@@ -220,6 +220,7 @@ private struct ProfileRow: View {
 private struct ProfileDetailView: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var nameDraft: String = ""
     @State private var lastSavedName: String = ""
 
@@ -236,13 +237,15 @@ private struct ProfileDetailView: View {
                 avatarPicker
             }
         )
-        .navigationBarBackButtonHidden(true)
+        .navigationBarBackButtonHidden(horizontalSizeClass == .compact)
         .toolbar {
-            ToolbarItem(placement: .navigationBarLeading) {
-                Button {
-                    dismiss()
-                } label: {
-                    Image(systemName: "chevron.left")
+            if horizontalSizeClass == .compact {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "chevron.left")
+                    }
                 }
             }
 
@@ -341,7 +344,7 @@ private struct StatusView: View {
                     }
                 } else {
                     ForEach(store.configuredInterfaces) { cfg in
-                        let runtime = store.interfaceStats.interfaces.first(where: { $0.short_name == cfg.name })
+                        let runtime = store.interfaceStats.interfaces.first(where: { $0.short_name == cfg.name || $0.name == cfg.name })
                         VStack(alignment: .leading, spacing: 4) {
                             HStack {
                                 Text(cfg.name)
@@ -554,6 +557,7 @@ private struct BlacklistView: View {
 
 private struct LogsView: View {
     @EnvironmentObject private var store: AppStore
+    @State private var showClearConfirm = false
 
     var body: some View {
         List {
@@ -566,8 +570,8 @@ private struct LogsView: View {
                 Text("Enables verbose Reticulum logs (level 6). Use this to debug network/discovery issues.")
             }
 
-            ForEach(store.logs.reversed(), id: \.self) { line in
-                Text(line)
+            ForEach(store.logs.indices.reversed(), id: \.self) { idx in
+                Text(store.logs[idx])
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
             }
@@ -581,6 +585,19 @@ private struct LogsView: View {
                     store.appendLog("logs copied")
                 }
             }
+            ToolbarItem(placement: .topBarLeading) {
+                Button("Clear") {
+                    showClearConfirm = true
+                }
+            }
+        }
+        .alert("Clear logs?", isPresented: $showClearConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Clear", role: .destructive) {
+                store.clearLogs()
+            }
+        } message: {
+            Text("This will remove all in-app logs.")
         }
     }
 }

@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/svanichkin/configobj"
@@ -60,19 +61,29 @@ type Node struct {
 
 	storageDir string
 
-	router         *lxmf.LXMRouter
-	deliveryDestIn *rns.Destination
-	profileDestIn  *rns.Destination
-	onInbound      func(*lxmf.LXMessage)
-	announceMu     sync.Mutex
-	announces      map[string]AnnounceEntry
+	router          *lxmf.LXMRouter
+	deliveryDestIn  *rns.Destination
+	profileDestIn   *rns.Destination
+	onInbound       func(*lxmf.LXMessage)
+	announceMu      sync.Mutex
+	announces       map[string]AnnounceEntry
 	announceHandler *announceLogger
 
-	displayName string
-	avatarPNG   []byte
-	avatarHash  []byte
-	avatarMTime int64
-	avatarMime  string
+	displayName      string
+	avatarPNG        []byte
+	avatarHash       []byte
+	avatarMTime      int64
+	avatarMime       string
+	announceStop     chan struct{}
+	announceStopOnce sync.Once
+
+	networkResetMu sync.Mutex
+	ifaceStateMu   sync.Mutex
+	ifaceOfflineAt map[string]time.Time
+	lastIfaceReset time.Time
+
+	announceInFlight int32
+	announceQueued   int32
 }
 
 func Start(opts Options) (*Node, error) {
@@ -149,6 +160,7 @@ func Start(opts Options) (*Node, error) {
 		storageDir:     storageDir,
 		displayName:    opts.DisplayName,
 		announces:      make(map[string]AnnounceEntry),
+		ifaceOfflineAt: make(map[string]time.Time),
 	}
 
 	// Load optional avatar from disk (app-managed).
@@ -163,6 +175,9 @@ func Start(opts Options) (*Node, error) {
 		}
 	})
 
+	// Best-effort periodic announce (helps peers discover us even if multicast is flaky).
+	n.startPeriodicAnnounce(60 * time.Second)
+	n.startInterfaceWatchdog()
 	return n, nil
 }
 
@@ -252,6 +267,9 @@ func (n *Node) Close() error {
 	if n == nil {
 		return nil
 	}
+	if n.announceStop != nil {
+		n.announceStopOnce.Do(func() { close(n.announceStop) })
+	}
 	if n.router != nil {
 		n.router.ExitHandler()
 	}
@@ -288,7 +306,10 @@ func (n *Node) SetInterfaceEnabled(name string, enabled bool) error {
 
 	// Apply without restart when possible.
 	if enabled {
-		return n.reticulum.ResumeInterface(name)
+		// Reload is more robust than Resume() here:
+		// - works even if the interface is already running (reconnects TCP client interfaces)
+		// - re-creates the driver instance after a halt/resume toggle
+		return n.reticulum.ReloadInterface(name)
 	}
 	return n.reticulum.HaltInterface(name)
 }
@@ -344,7 +365,7 @@ func (n *Node) Restart() error {
 	})
 
 	// Best-effort re-announce on restart.
-	n.AnnounceDelivery()
+	n.AnnounceDeliveryWithReason("restart")
 	return nil
 }
 
@@ -419,15 +440,469 @@ func (n *Node) SendHex(destinationHashHex string, msg SendOptions) (*lxmf.LXMess
 	return lxm, nil
 }
 
+func (n *Node) startInterfaceWatchdog() {
+	if n == nil {
+		return
+	}
+	// Watchdog: iOS can leave sockets half-dead after suspend/resume.
+	// If all enabled interfaces remain offline for a short window, we hard-reset
+	// enabled interfaces (halt+resume) to recreate sockets.
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				n.maybeResetInterfacesOnStall("watchdog")
+			case <-n.announceStop:
+				return
+			}
+		}
+	}()
+}
+
+func (n *Node) maybeResetInterfacesOnStall(reason string) {
+	if n == nil || n.reticulum == nil {
+		return
+	}
+	enabledCfg := n.enabledInterfaceConfigs()
+	if len(enabledCfg) == 0 {
+		return
+	}
+	statusByShort, statusByName := n.interfaceOnlineMaps()
+
+	now := time.Now()
+	anyOnline := false
+	longestOffline := time.Duration(0)
+
+	n.ifaceStateMu.Lock()
+	if n.ifaceOfflineAt == nil {
+		n.ifaceOfflineAt = make(map[string]time.Time)
+	}
+	for _, cfg := range enabledCfg {
+		name := strings.TrimSpace(cfg.Name)
+		if name == "" {
+			continue
+		}
+		on := false
+		if v, ok := statusByShort[name]; ok {
+			on = v
+		} else if v, ok := statusByName[name]; ok {
+			on = v
+		}
+		if on {
+			anyOnline = true
+			delete(n.ifaceOfflineAt, name)
+			continue
+		}
+		start, ok := n.ifaceOfflineAt[name]
+		if !ok {
+			n.ifaceOfflineAt[name] = now
+			start = now
+		}
+		d := now.Sub(start)
+		if d > longestOffline {
+			longestOffline = d
+		}
+	}
+	lastReset := n.lastIfaceReset
+	n.ifaceStateMu.Unlock()
+
+	// Trigger reset only if *everything enabled* is offline for a bit.
+	if anyOnline {
+		return
+	}
+	if longestOffline < 6*time.Second {
+		return
+	}
+	if !lastReset.IsZero() && time.Since(lastReset) < 12*time.Second {
+		return
+	}
+
+	n.ifaceStateMu.Lock()
+	n.lastIfaceReset = time.Now()
+	n.ifaceStateMu.Unlock()
+	rns.Logf(rns.LOG_DEBUG, "%s: watchdog triggering interface reset (offline_for=%s)", reason, longestOffline)
+	n.resetEnabledInterfaces(reason)
+}
+
 func (n *Node) AnnounceDelivery() {
 	if n == nil || n.router == nil || n.deliveryDestIn == nil {
 		return
 	}
-	// Do not rely on lxmf.Router.GetAnnounceAppData() here because it reads
-	// unexported internal config. We generate the announce app-data ourselves,
-	// matching lxmf.Router.GetAnnounceAppData() format.
-	appData := n.announceAppData()
-	n.deliveryDestIn.Announce(appData, false, nil, nil, true)
+	n.AnnounceDeliveryWithReason("manual")
+}
+
+func (n *Node) AnnounceDeliveryWithReason(reason string) {
+	if n == nil || n.router == nil || n.deliveryDestIn == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "manual"
+	}
+
+	if !atomic.CompareAndSwapInt32(&n.announceInFlight, 0, 1) {
+		atomic.StoreInt32(&n.announceQueued, 1)
+		return
+	}
+
+	stopCh := n.announceStop
+	destHex := hex.EncodeToString(n.deliveryDestIn.Hash())
+
+	// Announce can happen early (before interfaces are online) and produces noisy
+	// "No interfaces could process the outbound packet" logs. We wait briefly for
+	// usable connectivity. If TCP is enabled, we prefer waiting for TCP to be online,
+	// but we will still announce over any online enabled interface after a short
+	// grace period. (AutoInterface can be unreliable on some networks.)
+	go func() {
+		// On mobile suspend/resume, sockets can end up half-dead (looks connected but
+		// no traffic flows). For iOS we do a hard interface reset: halt all enabled
+		// interfaces and bring them up again before we announce.
+		if reason == "resume" {
+			n.resetEnabledInterfaces(reason)
+		}
+
+		deadline := time.Now().Add(20 * time.Second)
+		preferDeadline := time.Now().Add(6 * time.Second)
+		for {
+			if stopCh != nil {
+				select {
+				case <-stopCh:
+					atomic.StoreInt32(&n.announceInFlight, 0)
+					return
+				default:
+				}
+			}
+
+			ready, _, _, _ := n.announceReady(preferDeadline)
+			if ready {
+				// Require a brief stable window (TCP can flap right after connect).
+				time.Sleep(1 * time.Second)
+				ready2, _, _, _ := n.announceReady(time.Now())
+				if ready2 {
+					break
+				}
+			}
+			if time.Now().After(deadline) {
+				_, enabled, online, offline := n.announceReady(time.Now())
+				if len(enabled) == 0 {
+					rns.Logf(rns.LOG_NOTICE, "Announce tx dest=%s reason=%s skipped=no_enabled_interfaces", destHex, reason)
+				} else {
+					rns.Logf(rns.LOG_NOTICE, "Announce tx dest=%s reason=%s skipped=no_usable_interfaces enabled=%s online=%s offline=%s",
+						destHex, reason,
+						strings.Join(enabled, ","),
+						strings.Join(online, ","),
+						strings.Join(offline, ","),
+					)
+				}
+				atomic.StoreInt32(&n.announceInFlight, 0)
+				return
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		_, enabled, online, offline := n.announceReady(time.Now())
+		if len(enabled) > 0 {
+			rns.Logf(rns.LOG_NOTICE, "Announce tx dest=%s reason=%s enabled=%s online=%s offline=%s",
+				destHex, reason,
+				strings.Join(enabled, ","),
+				strings.Join(online, ","),
+				strings.Join(offline, ","),
+			)
+		} else {
+			rns.Logf(rns.LOG_NOTICE, "Announce tx dest=%s reason=%s", destHex, reason)
+		}
+
+		// Do not rely on lxmf.Router.GetAnnounceAppData() here because it reads
+		// unexported internal config. We generate the announce app-data ourselves,
+		// matching lxmf.Router.GetAnnounceAppData() format.
+		appData := n.announceAppData()
+
+		pkt := n.deliveryDestIn.Announce(appData, false, nil, nil, false)
+		if pkt != nil {
+			_ = pkt.Send()
+		}
+
+		atomic.StoreInt32(&n.announceInFlight, 0)
+		if atomic.SwapInt32(&n.announceQueued, 0) == 1 {
+			n.AnnounceDeliveryWithReason("queued")
+		}
+	}()
+}
+
+// kickEnabledInterfaces force-reloads enabled interfaces. This is mainly a resilience
+// measure for mobile suspend/resume where sockets can become half-open.
+func (n *Node) kickEnabledInterfaces() {
+	if n == nil || n.reticulum == nil {
+		return
+	}
+	enabledCfg := n.enabledInterfaceConfigs()
+	if len(enabledCfg) == 0 {
+		return
+	}
+
+	statusByShort, statusByName := n.interfaceOnlineMaps()
+
+	for _, cfg := range enabledCfg {
+		name := strings.TrimSpace(cfg.Name)
+		if name == "" {
+			continue
+		}
+		typ := strings.ToLower(strings.TrimSpace(cfg.Type))
+		isTCP := strings.Contains(typ, "tcp")
+
+		on := false
+		if v, ok := statusByShort[name]; ok {
+			on = v
+		} else if v, ok := statusByName[name]; ok {
+			on = v
+		}
+
+		// Always kick TCP on resume; kick others only if currently offline.
+		if !isTCP && on {
+			continue
+		}
+		if err := n.reticulum.ReloadInterface(name); err != nil {
+			rns.Logf(rns.LOG_DEBUG, "resume: reload interface failed name=%s err=%v", name, err)
+			continue
+		}
+		rns.Logf(rns.LOG_DEBUG, "resume: reloaded interface name=%s", name)
+	}
+}
+
+func (n *Node) resetEnabledInterfaces(reason string) {
+	if n == nil || n.reticulum == nil {
+		return
+	}
+	// Serialize resets; we do not want concurrent resume events to flap interfaces.
+	n.networkResetMu.Lock()
+	defer n.networkResetMu.Unlock()
+
+	enabled := n.enabledInterfaceConfigs()
+	if len(enabled) == 0 {
+		rns.Logf(rns.LOG_DEBUG, "%s: interface reset skipped (no enabled interfaces)", reason)
+		return
+	}
+
+	names := make([]string, 0, len(enabled))
+	for _, cfg := range enabled {
+		name := strings.TrimSpace(cfg.Name)
+		if name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		rns.Logf(rns.LOG_DEBUG, "%s: interface reset skipped (no valid names)", reason)
+		return
+	}
+
+	rns.Logf(rns.LOG_DEBUG, "%s: interface reset begin enabled=%s", reason, strings.Join(names, ","))
+
+	// Halt first (best-effort). This tears down sockets and stops per-interface goroutines.
+	for _, name := range names {
+		if err := n.reticulum.HaltInterface(name); err != nil {
+			rns.Logf(rns.LOG_DEBUG, "%s: halt interface failed name=%s err=%v", reason, name, err)
+		} else {
+			rns.Logf(rns.LOG_DEBUG, "%s: halted interface name=%s", reason, name)
+		}
+	}
+
+	// Small grace period to let the OS release sockets after suspend.
+	time.Sleep(400 * time.Millisecond)
+
+	// Resume in original order (best-effort).
+	for _, name := range names {
+		if err := n.reticulum.ResumeInterface(name); err != nil {
+			rns.Logf(rns.LOG_DEBUG, "%s: resume interface failed name=%s err=%v", reason, name, err)
+		} else {
+			rns.Logf(rns.LOG_DEBUG, "%s: resumed interface name=%s", reason, name)
+		}
+	}
+
+	rns.Logf(rns.LOG_DEBUG, "%s: interface reset end", reason)
+}
+
+func (n *Node) announceReady(preferDeadline time.Time) (bool, []string, []string, []string) {
+	enabledCfg := n.enabledInterfaceConfigs()
+	if len(enabledCfg) == 0 {
+		if n.hasAnyOnlineInterface() {
+			return true, nil, nil, nil
+		}
+		return false, nil, nil, nil
+	}
+
+	statusByShort, statusByName := n.interfaceOnlineMaps()
+	enabled := make([]string, 0, len(enabledCfg))
+	online := make([]string, 0, len(enabledCfg))
+	offline := make([]string, 0, len(enabledCfg))
+
+	hasTCPEnabled := false
+	hasTCPOnline := false
+
+	for _, cfg := range enabledCfg {
+		name := cfg.Name
+		enabled = append(enabled, name)
+
+		typ := strings.ToLower(strings.TrimSpace(cfg.Type))
+		isTCP := strings.Contains(typ, "tcp")
+		if isTCP {
+			hasTCPEnabled = true
+		}
+
+		on := false
+		if v, ok := statusByShort[name]; ok {
+			on = v
+		} else if v, ok := statusByName[name]; ok {
+			on = v
+		}
+		if on {
+			online = append(online, name)
+			if isTCP {
+				hasTCPOnline = true
+			}
+		} else {
+			offline = append(offline, name)
+		}
+	}
+
+	if len(online) == 0 {
+		return false, enabled, online, offline
+	}
+
+	// Prefer waiting for TCP if enabled (it is usually the path to the wider network).
+	if hasTCPEnabled && !hasTCPOnline && time.Now().Before(preferDeadline) {
+		return false, enabled, online, offline
+	}
+
+	return true, enabled, online, offline
+}
+
+func (n *Node) enabledInterfaceConfigs() []configuredInterfaceEntry {
+	if n == nil || n.reticulum == nil || n.reticulum.ConfigPath == "" {
+		return nil
+	}
+	cfg, err := configobj.Load(n.reticulum.ConfigPath)
+	if err != nil {
+		return nil
+	}
+	if !cfg.HasSection("interfaces") {
+		return nil
+	}
+	sec := cfg.Section("interfaces")
+	names := sec.Sections()
+	sort.Strings(names)
+
+	out := make([]configuredInterfaceEntry, 0, len(names))
+	for _, name := range names {
+		s := sec.Subsection(name)
+		typ, _ := s.Get("type")
+		enabled := false
+		if v, ok := s.Get("interface_enabled"); ok {
+			enabled = parseTruthyString(v)
+		} else if v, ok := s.Get("enabled"); ok {
+			enabled = parseTruthyString(v)
+		} else if v, ok := s.Get("enable"); ok {
+			enabled = parseTruthyString(v)
+		}
+		if enabled {
+			out = append(out, configuredInterfaceEntry{Name: name, Type: typ, Enabled: true})
+		}
+	}
+	return out
+}
+
+func (n *Node) interfaceOnlineMaps() (map[string]bool, map[string]bool) {
+	statusByShort := map[string]bool{}
+	statusByName := map[string]bool{}
+	if n == nil || n.reticulum == nil {
+		return statusByShort, statusByName
+	}
+	stats := n.reticulum.GetInterfaceStats()
+	raw := stats["interfaces"]
+	if raw == nil {
+		return statusByShort, statusByName
+	}
+
+	extract := func(entry map[string]any) {
+		var (
+			short string
+			name  string
+		)
+		if v, ok := entry["short_name"].(string); ok {
+			short = strings.TrimSpace(v)
+		}
+		if v, ok := entry["name"].(string); ok {
+			name = strings.TrimSpace(v)
+		}
+		status, _ := entry["status"].(bool)
+		if short != "" {
+			statusByShort[short] = status
+		}
+		if name != "" {
+			statusByName[name] = status
+		}
+	}
+
+	switch v := raw.(type) {
+	case []map[string]any:
+		for _, entry := range v {
+			extract(entry)
+		}
+	case []any:
+		for _, item := range v {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			extract(entry)
+		}
+	}
+	return statusByShort, statusByName
+}
+
+func (n *Node) hasAnyOnlineInterface() bool {
+	if n == nil || n.reticulum == nil {
+		return false
+	}
+	statusByShort, statusByName := n.interfaceOnlineMaps()
+	for _, v := range statusByShort {
+		if v {
+			return true
+		}
+	}
+	for _, v := range statusByName {
+		if v {
+			return true
+		}
+	}
+	return false
+}
+
+func (n *Node) startPeriodicAnnounce(interval time.Duration) {
+	if n == nil {
+		return
+	}
+	if interval <= 0 {
+		return
+	}
+	if n.announceStop != nil {
+		return
+	}
+	n.announceStop = make(chan struct{})
+	t := time.NewTicker(interval)
+	go func() {
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				n.AnnounceDeliveryWithReason("periodic")
+			case <-n.announceStop:
+				return
+			}
+		}
+	}()
 }
 
 // SetDisplayName updates LXMF announce app-data (display_name) for this node.
@@ -443,19 +918,35 @@ func (n *Node) SetDisplayName(name string) error {
 }
 
 func (n *Node) SetAvatarPNG(png []byte) error {
+	return n.SetAvatarImage("", png)
+}
+
+func (n *Node) SetAvatarHEIC(heic []byte) error {
+	return n.SetAvatarImage("image/heic", heic)
+}
+
+func (n *Node) SetAvatarImage(mime string, data []byte) error {
 	if n == nil {
 		return errors.New("node not started")
 	}
-	if len(png) == 0 {
+	if len(data) == 0 {
 		return errors.New("empty avatar")
 	}
-	sum := sha256.Sum256(png)
-	n.avatarPNG = append([]byte(nil), png...)
+	mime = strings.TrimSpace(mime)
+	if mime == "" {
+		mime = detectAvatarMime(data)
+	}
+	if mime == "" {
+		return errors.New("unknown avatar mime")
+	}
+	sum := sha256.Sum256(data)
+	n.avatarPNG = append([]byte(nil), data...)
 	n.avatarHash = append([]byte(nil), sum[:16]...)
 	n.avatarMTime = time.Now().Unix()
-	n.avatarMime = detectAvatarMime(png)
+	n.avatarMime = mime
 	return n.saveAvatarToDisk()
 }
+
 
 func (n *Node) ClearAvatar() error {
 	if n == nil {
@@ -488,10 +979,10 @@ func (n *Node) announceAppData() []byte {
 			mime = "image/png"
 		}
 		avatar = map[any]any{
-			"h": n.avatarHash,        // bytes
-			"t": mime,                // mime
-			"s": len(n.avatarPNG),    // size
-			"u": n.avatarMTime,       // updated (unix)
+			"h": n.avatarHash,     // bytes
+			"t": mime,             // mime
+			"s": len(n.avatarPNG), // size
+			"u": n.avatarMTime,    // updated (unix)
 		}
 	}
 
@@ -669,6 +1160,30 @@ func ensureRNSAutoInterfaceDefaults(cfgPath string) error {
 			ifc.Set("devices", strings.Join(devs, ", "))
 			changed = true
 		}
+	} else {
+		// Some environments (notably Mac Catalyst with VPNs) expose many virtual interfaces
+		// (eg. utun*, awdl0) that tend to break multicast discovery. If the user config
+		// already pins devices, sanitize the list by removing obviously-bad defaults.
+		parts := strings.Split(v, ",")
+		filtered := make([]string, 0, len(parts))
+		for _, p := range parts {
+			name := strings.TrimSpace(p)
+			if name == "" {
+				continue
+			}
+			if strings.HasPrefix(name, "utun") || name == "awdl0" {
+				continue
+			}
+			filtered = append(filtered, name)
+		}
+		if len(filtered) == 0 {
+			filtered = autoInterfaceDefaultDevices()
+		}
+		normalized := strings.Join(filtered, ", ")
+		if strings.TrimSpace(normalized) != strings.TrimSpace(v) && normalized != "" {
+			ifc.Set("devices", normalized)
+			changed = true
+		}
 	}
 	if v, ok := ifc.Get("ingress_control"); !ok || strings.TrimSpace(v) == "" {
 		ifc.Set("ingress_control", "no")
@@ -700,10 +1215,10 @@ func autoInterfaceDefaultDevices() []string {
 		// If nothing matches, we fall back to AutoInterface's own behaviour.
 		switch {
 		case strings.HasPrefix(name, "en"), // macOS/iOS
-			strings.HasPrefix(name, "eth"),  // linux
-			strings.HasPrefix(name, "wlan"), // linux
-			strings.HasPrefix(name, "wlp"),  // linux (systemd)
-			strings.HasPrefix(name, "wl"),   // some BSDs
+			strings.HasPrefix(name, "eth"),    // linux
+			strings.HasPrefix(name, "wlan"),   // linux
+			strings.HasPrefix(name, "wlp"),    // linux (systemd)
+			strings.HasPrefix(name, "wl"),     // some BSDs
 			strings.HasPrefix(name, "pdp_ip"): // iOS cellular
 			seen[name] = true
 			out = append(out, name)
@@ -721,17 +1236,23 @@ func defaultInlineRNSConfig(logLevel int) string {
 		logLevel = 7
 	}
 	return fmt.Sprintf(`[reticulum]
-enable_transport = False
-share_instance = False
-instance_name = default
+	enable_transport = False
+	share_instance = False
+	instance_name = default
 
-[logging]
-loglevel = %d
+	[logging]
+	loglevel = %d
 
-[interfaces]
-  [[Default Interface]]
-    type = AutoInterface
-    interface_enabled = Yes
-    ingress_control = no
-`, logLevel)
+	[interfaces]
+	  [[Default Interface]]
+	    type = AutoInterface
+	    interface_enabled = Yes
+	    ingress_control = no
+
+	  [[TCP Client Interface]]
+	    type = TCPClientInterface
+	    interface_enabled = Yes
+	    target_host = reticulum.betweentheborders.com
+	    target_port = 4242
+	`, logLevel)
 }

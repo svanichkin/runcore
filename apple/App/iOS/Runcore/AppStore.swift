@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import ImageIO
 import UIKit
 import UniformTypeIdentifiers
@@ -42,6 +43,7 @@ final class AppStore: ObservableObject {
     private var rawLogFlushTask: Task<Void, Never>?
     private var inboundPromptQueue: [InboundPrompt] = []
     private var inboundAvatarTask: Task<Void, Never>?
+    private var lastAnnounceRequestAt: Date?
 
     private let readReceiptTitle = "_read"
     private var outboundRetryTask: Task<Void, Never>?
@@ -90,6 +92,28 @@ final class AppStore: ObservableObject {
             }
 
             if let contact = self.contacts.first(where: { $0.destinationHashHex == src }) {
+                if let parsed = self.parseAttachmentMessage(title: trimmedTitle, content: content) {
+                    let localID = UUID()
+                    self.messagesByContactID[contact.id, default: []].append(
+                        ChatMessage(
+                            id: localID,
+                            direction: .inbound,
+                            text: parsed.caption,
+                            attachment: MessageAttachment(
+                                hashHex: parsed.hashHex,
+                                mime: parsed.mime,
+                                name: parsed.name,
+                                size: parsed.size,
+                                localPath: nil
+                            ),
+                            title: "img",
+                            lxmfMessageIDHex: messageIDHex
+                        )
+                    )
+                    self.save()
+                    self.fetchAttachment(remoteHashHex: src, contactID: contact.id, localMessageID: localID, attachmentHashHex: parsed.hashHex)
+                    return
+                }
                 self.messagesByContactID[contact.id, default: []].append(
                     ChatMessage(direction: .inbound, text: content, title: trimmedTitle, lxmfMessageIDHex: messageIDHex)
                 )
@@ -106,7 +130,8 @@ final class AppStore: ObservableObject {
         engine.start()
         appendLog("engine started (iOS stub)")
         if let avatar = profileAvatarData, !avatar.isEmpty {
-            let rc = engine.setAvatarPNG(avatar)
+            let normalized = normalizeAvatarData(avatar) ?? avatar
+            let rc = engine.setAvatarImage(mime: "image/heic", data: normalized)
             if rc != 0 { appendLog("set avatar failed rc=\(rc)") }
         }
         refreshInterfaceStats()
@@ -131,6 +156,163 @@ final class AppStore: ObservableObject {
                 self.retryPendingOutboundIfNeeded()
             }
         }
+    }
+
+    func requestAnnounce(reason: String) {
+        let now = Date()
+        if let last = lastAnnounceRequestAt, now.timeIntervalSince(last) < 3 {
+            return
+        }
+        lastAnnounceRequestAt = now
+        let rc = engine.announce(reason: reason)
+        if rc == 0 {
+            appendLog("announce requested (\(reason))")
+        } else {
+            appendLog("announce requested (\(reason)) failed rc=\(rc)")
+        }
+    }
+
+    func sendImageAttachment(to contactID: UUID, data: Data, suggestedName: String?, caption: String) {
+        guard !data.isEmpty else { return }
+        guard let contact = contacts.first(where: { $0.id == contactID }) else { return }
+
+        let stored = engine.storeAttachment(mime: nil, name: suggestedName, data: data)
+        guard let stored else {
+            appendLog("store attachment failed: no response")
+            return
+        }
+        if let err = stored.error, !err.isEmpty {
+            appendLog("store attachment failed: \(err)")
+            return
+        }
+        guard stored.rc == 0, let hash = stored.hashHex, !hash.isEmpty else {
+            appendLog("store attachment failed rc=\(stored.rc)")
+            return
+        }
+
+        let outPath = self.outboundAttachmentPath(hashHex: hash)
+        do {
+            try FileManager.default.createDirectory(at: URL(fileURLWithPath: outPath).deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: URL(fileURLWithPath: outPath), options: [.atomic])
+        } catch {
+            appendLog("attachment save failed: \(error)")
+        }
+
+        let messageText = caption
+        var msg = ChatMessage(
+            direction: .outbound,
+            text: messageText,
+            attachment: MessageAttachment(
+                hashHex: hash,
+                mime: stored.mime,
+                name: stored.name ?? suggestedName,
+                size: stored.size,
+                localPath: outPath
+            ),
+            title: "img",
+            outboundStatus: .pending
+        )
+        messagesByContactID[contactID, default: []].append(msg)
+        save()
+
+        let payload = formatAttachmentMessage(hashHex: hash, mime: stored.mime, name: stored.name ?? suggestedName, size: stored.size, caption: caption)
+        let localMsgID = msg.id
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let result = self.engine.sendResult(destHashHex: contact.destinationHashHex, title: "img", content: payload)
+            await MainActor.run {
+                self.updateOutboundMessage(contactID: contactID, localID: localMsgID, sendResult: result)
+            }
+        }
+    }
+
+    private func formatAttachmentMessage(hashHex: String, mime: String?, name: String?, size: Int?, caption: String) -> String {
+        var lines: [String] = []
+        lines.append("hash=\(hashHex)")
+        if let mime, !mime.isEmpty { lines.append("mime=\(mime)") }
+        if let name, !name.isEmpty { lines.append("name=\(name)") }
+        if let size { lines.append("size=\(size)") }
+        lines.append("caption=\(caption)")
+        return lines.joined(separator: "\n")
+    }
+
+    private struct AttachmentParsed {
+        let hashHex: String
+        let mime: String?
+        let name: String?
+        let size: Int?
+        let caption: String
+    }
+
+    private func parseAttachmentMessage(title: String, content: String) -> AttachmentParsed? {
+        guard title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "img" else { return nil }
+        var hash: String?
+        var mime: String?
+        var name: String?
+        var size: Int?
+        var caption = ""
+        for line in content.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2 else { continue }
+            let key = parts[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let value = String(parts[1])
+            switch key {
+            case "hash":
+                hash = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            case "mime":
+                mime = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            case "name":
+                name = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            case "size":
+                size = Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+            case "caption":
+                caption = value
+            default:
+                continue
+            }
+        }
+        guard let hash, !hash.isEmpty else { return nil }
+        return AttachmentParsed(hashHex: hash, mime: mime, name: name, size: size, caption: caption)
+    }
+
+    private func outboundAttachmentPath(hashHex: String) -> String {
+        let hash = hashHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let fm = FileManager.default
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let base = appSupport.appendingPathComponent("Runcore", isDirectory: true)
+        return base.appendingPathComponent("attachments", isDirectory: true)
+            .appendingPathComponent("out", isDirectory: true)
+            .appendingPathComponent("\(hash).bin")
+            .path
+    }
+
+    private func fetchAttachment(remoteHashHex: String, contactID: UUID, localMessageID: UUID, attachmentHashHex: String) {
+        let remote = normalizeDestinationHashHex(remoteHashHex)
+        let hash = attachmentHashHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !remote.isEmpty, !hash.isEmpty else { return }
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let resp = self.engine.contactAttachment(destHashHex: remote, attachmentHashHex: hash, timeoutMs: 20000)
+            await MainActor.run {
+                guard let resp else { return }
+                if let err = resp.error, !err.isEmpty {
+                    self.appendLog("attachment fetch failed for \(remote): \(err)")
+                    return
+                }
+                guard let path = resp.path, !path.isEmpty else { return }
+                self.setAttachmentPath(contactID: contactID, localMessageID: localMessageID, path: path)
+            }
+        }
+    }
+
+    private func setAttachmentPath(contactID: UUID, localMessageID: UUID, path: String) {
+        guard var list = messagesByContactID[contactID] else { return }
+        guard let idx = list.firstIndex(where: { $0.id == localMessageID }) else { return }
+        guard var att = list[idx].attachment else { return }
+        att.localPath = path
+        list[idx].attachment = att
+        messagesByContactID[contactID] = list
+        save()
     }
 
     deinit {
@@ -188,6 +370,14 @@ final class AppStore: ObservableObject {
         if logs.count > 5000 { logs.removeFirst(logs.count - 5000) }
     }
 
+    func clearLogs() {
+        rawLogFlushTask?.cancel()
+        rawLogFlushTask = nil
+        pendingRawLogLines.removeAll(keepingCapacity: true)
+        logs.removeAll(keepingCapacity: true)
+        save()
+    }
+
     func appendRawLog(_ line: String) {
         NSLog("%@", line)
         pendingRawLogLines.append(line)
@@ -214,7 +404,7 @@ final class AppStore: ObservableObject {
         profileAvatarData = normalized
         save()
         if let normalized, !normalized.isEmpty {
-            let rc = engine.setAvatarPNG(normalized)
+            let rc = engine.setAvatarImage(mime: "image/heic", data: normalized)
             if rc != 0 { appendLog("set avatar failed rc=\(rc)") }
             return
         }
@@ -239,10 +429,10 @@ final class AppStore: ObservableObject {
         let output = renderer.image { _ in
             image.draw(in: CGRect(origin: .zero, size: targetSize))
         }
-        if let heic = encodeHEIC(output, quality: 0.78) {
+        if let heic = encodeHEIC(output, quality: 0.05) {
             return heic
         }
-        return output.jpegData(compressionQuality: 0.85) ?? output.pngData() ?? data
+        return output.jpegData(compressionQuality: 0.05) ?? output.pngData() ?? data
     }
 
     private func encodeHEIC(_ image: UIImage, quality: CGFloat) -> Data? {
@@ -381,7 +571,7 @@ final class AppStore: ObservableObject {
                 self.contacts.first(where: { $0.id == contactID })?.avatarHashHex?.lowercased()
             }
             let alreadyHaveAvatar: Bool = await MainActor.run {
-                self.contacts.first(where: { $0.id == contactID })?.avatarPNGData != nil
+                self.contacts.first(where: { $0.id == contactID })?.avatarData != nil
             }
 
             let shouldFetchAvatar: Bool = {
@@ -410,11 +600,11 @@ final class AppStore: ObservableObject {
                 }
                 return
             }
-            if let b64 = resp?.pngBase64,
+            if let b64 = (resp?.dataBase64 ?? resp?.pngBase64),
                let data = Data(base64Encoded: b64), !data.isEmpty {
                 await MainActor.run {
                     guard let idx = self.contacts.firstIndex(where: { $0.id == contactID }) else { return }
-                    self.contacts[idx].avatarPNGData = data
+                    self.contacts[idx].avatarData = data
                     self.contacts[idx].avatarHashHex = resp?.hashHex ?? announcedAvatarHash
                     self.save()
                     self.appendLog("fetched avatar for \(dest)")
@@ -460,7 +650,7 @@ final class AppStore: ObservableObject {
                     self.appendLog("avatar preview returned no response for \(dest)")
                 }
             }
-            if let b64 = resp?.pngBase64,
+            if let b64 = (resp?.dataBase64 ?? resp?.pngBase64),
                let data = Data(base64Encoded: b64), !data.isEmpty {
                 preview.avatarData = data
                 if preview.avatarHashHex == nil {
@@ -833,19 +1023,19 @@ final class AppStore: ObservableObject {
                 displayName: initialName == "Unknown" ? dest : initialName,
                 destinationHashHex: dest,
                 avatarHashHex: inboundPromptAvatarHashHex,
-                avatarPNGData: inboundPromptAvatarData
+                avatarData: inboundPromptAvatarData
             )
             contacts.append(contact)
             contactID = contact.id
         }
-        if let idx = contacts.firstIndex(where: { $0.id == contactID }) {
-            if let inboundPromptAvatarData {
-                contacts[idx].avatarPNGData = inboundPromptAvatarData
+            if let idx = contacts.firstIndex(where: { $0.id == contactID }) {
+                if let inboundPromptAvatarData {
+                contacts[idx].avatarData = inboundPromptAvatarData
+                }
+                if let inboundPromptAvatarHashHex {
+                    contacts[idx].avatarHashHex = inboundPromptAvatarHashHex
+                }
             }
-            if let inboundPromptAvatarHashHex {
-                contacts[idx].avatarHashHex = inboundPromptAvatarHashHex
-            }
-        }
         messagesByContactID[contactID, default: []].append(
             ChatMessage(direction: .inbound, text: prompt.content, title: prompt.title, lxmfMessageIDHex: prompt.messageIDHex)
         )

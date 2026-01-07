@@ -35,13 +35,27 @@ func (n *Node) ContactInfoHex(destinationHashHex string, timeout time.Duration) 
 	}
 
 	var id *rns.Identity
-	if timeout > 0 {
-		id, _ = n.WaitForIdentityHex(destinationHashHex, timeout)
-	} else {
+	if timeout <= 0 {
 		id = rns.IdentityRecall(destHash)
-	}
-	if id == nil || len(id.AppData) == 0 {
-		return ContactInfo{}, nil
+		if id == nil || len(id.AppData) == 0 {
+			return ContactInfo{}, nil
+		}
+	} else {
+		// Important for macCatalyst: we can have an identity in cache without having
+		// a path/announce, which means AppData (display name + avatar metadata) is empty.
+		// Requesting a path triggers peers/routers to announce, which populates AppData.
+		rns.TransportRequestPath(destHash)
+		deadline := time.Now().Add(timeout)
+		for {
+			id = rns.IdentityRecall(destHash)
+			if id != nil && len(id.AppData) > 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				return ContactInfo{}, nil
+			}
+			time.Sleep(120 * time.Millisecond)
+		}
 	}
 
 	var unpacked []any
@@ -103,4 +117,3 @@ func (n *Node) ContactInfoHex(destinationHashHex string, timeout time.Duration) 
 
 	return out, nil
 }
-

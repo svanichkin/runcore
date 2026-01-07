@@ -6,16 +6,16 @@ struct Contact: Identifiable, Codable, Hashable {
     var localDisplayName: String?
     var destinationHashHex: String
     var avatarHashHex: String?
-    var avatarPNGData: Data?
+    var avatarData: Data?
     var localAvatarData: Data?
 
-    init(id: UUID = UUID(), displayName: String, destinationHashHex: String, avatarHashHex: String? = nil, avatarPNGData: Data? = nil, localDisplayName: String? = nil, localAvatarData: Data? = nil) {
+    init(id: UUID = UUID(), displayName: String, destinationHashHex: String, avatarHashHex: String? = nil, avatarData: Data? = nil, localDisplayName: String? = nil, localAvatarData: Data? = nil) {
         self.id = id
         self.displayName = displayName
         self.localDisplayName = localDisplayName
         self.destinationHashHex = destinationHashHex
         self.avatarHashHex = avatarHashHex
-        self.avatarPNGData = avatarPNGData
+        self.avatarData = avatarData
         self.localAvatarData = localAvatarData
     }
 }
@@ -28,7 +28,7 @@ extension Contact {
     }
 
     var resolvedAvatarData: Data? {
-        localAvatarData ?? avatarPNGData
+        localAvatarData ?? avatarData
     }
 }
 
@@ -44,12 +44,21 @@ enum OutboundStatus: String, Codable {
     case failed
 }
 
+struct MessageAttachment: Codable, Hashable {
+    let hashHex: String
+    var mime: String?
+    var name: String?
+    var size: Int?
+    var localPath: String?
+}
+
 struct ChatMessage: Identifiable, Codable, Hashable {
     let id: UUID
     let timestamp: Date
     let direction: MessageDirection
     let title: String
     let text: String
+    var attachment: MessageAttachment?
     var lxmfMessageIDHex: String?
     var outboundStatus: OutboundStatus?
     var didSendReadReceipt: Bool
@@ -62,6 +71,7 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         timestamp: Date = Date(),
         direction: MessageDirection,
         text: String,
+        attachment: MessageAttachment? = nil,
         title: String = "",
         lxmfMessageIDHex: String? = nil,
         outboundStatus: OutboundStatus? = nil,
@@ -75,6 +85,7 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         self.direction = direction
         self.title = title
         self.text = text
+        self.attachment = attachment
         self.lxmfMessageIDHex = lxmfMessageIDHex
         self.outboundStatus = outboundStatus
         self.didSendReadReceipt = didSendReadReceipt
@@ -89,6 +100,7 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         case direction
         case title
         case text
+        case attachment
         case lxmfMessageIDHex
         case outboundStatus
         case didSendReadReceipt
@@ -104,6 +116,7 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         direction = try container.decode(MessageDirection.self, forKey: .direction)
         title = try container.decode(String.self, forKey: .title)
         text = try container.decode(String.self, forKey: .text)
+        attachment = try container.decodeIfPresent(MessageAttachment.self, forKey: .attachment)
         lxmfMessageIDHex = try container.decodeIfPresent(String.self, forKey: .lxmfMessageIDHex)
         outboundStatus = try container.decodeIfPresent(OutboundStatus.self, forKey: .outboundStatus)
         didSendReadReceipt = try container.decodeIfPresent(Bool.self, forKey: .didSendReadReceipt) ?? false
@@ -119,6 +132,7 @@ struct ChatMessage: Identifiable, Codable, Hashable {
         try container.encode(direction, forKey: .direction)
         try container.encode(title, forKey: .title)
         try container.encode(text, forKey: .text)
+        try container.encodeIfPresent(attachment, forKey: .attachment)
         try container.encodeIfPresent(lxmfMessageIDHex, forKey: .lxmfMessageIDHex)
         try container.encodeIfPresent(outboundStatus, forKey: .outboundStatus)
         try container.encode(didSendReadReceipt, forKey: .didSendReadReceipt)
