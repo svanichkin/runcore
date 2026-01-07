@@ -635,6 +635,7 @@ private struct ProfileAvatarSizer: ViewModifier {
 	    let message: ChatMessage
 	    let contactDestHashHex: String
 	    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+	    @State private var imagePreview: IdentifiableImage?
 
 	    var body: some View {
 	        let isOutgoing = message.direction == .outbound
@@ -652,43 +653,52 @@ private struct ProfileAvatarSizer: ViewModifier {
 
 	            if !isOutgoing { Spacer(minLength: 0) }
 	        }
-	    }
-
-	    @ViewBuilder
-	    private func textBubble(title: String, isOutgoing: Bool, maxBubbleWidth: CGFloat) -> some View {
-	        VStack(alignment: .leading, spacing: 4) {
-	            if !title.isEmpty && title.lowercased() != "msg" && title.lowercased() != "img" {
-	                Text(title)
-	                    .font(.caption)
-	                    .foregroundStyle(isOutgoing ? .white.opacity(0.85) : .secondary)
-	            }
-
-	            Text(message.text)
-	                .foregroundStyle(isOutgoing ? .white : .primary)
-	                .textSelection(.enabled)
-
-	            HStack(spacing: 6) {
-	                Spacer(minLength: 0)
-	                Text(message.timestamp, style: .time)
-	                    .font(.caption2)
-	                    .foregroundStyle(isOutgoing ? .white.opacity(0.75) : .secondary)
-	                if isOutgoing {
-	                    receiptMarks
-	                }
-	            }
+	        .fullScreenCover(item: $imagePreview) { uiImage in
+	            ImageFullscreenPreview(image: uiImage.image)
 	        }
-	        .padding(.horizontal, 12)
-	        .padding(.vertical, 9)
-	        .background(isOutgoing ? Color.accentColor : Color.gray.opacity(0.14))
-	        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-	        .frame(maxWidth: maxBubbleWidth, alignment: .leading)
 	    }
+
+		    @ViewBuilder
+		    private func textBubble(title: String, isOutgoing: Bool, maxBubbleWidth: CGFloat) -> some View {
+		        VStack(alignment: .leading, spacing: 4) {
+		            if !title.isEmpty && title.lowercased() != "msg" && title.lowercased() != "img" {
+		                Text(title)
+		                    .font(.caption)
+		                    .foregroundStyle(isOutgoing ? .white.opacity(0.85) : .secondary)
+		            }
+
+		            Text(message.text)
+		                .foregroundStyle(isOutgoing ? .white : .primary)
+		                .textSelection(.enabled)
+
+		            HStack(spacing: 6) {
+		                Spacer(minLength: 0)
+		                Text(message.timestamp, style: .time)
+		                    .font(.caption2)
+		                    .foregroundStyle(isOutgoing ? .white.opacity(0.75) : .secondary)
+		                if isOutgoing {
+		                    receiptMarks
+		                }
+		            }
+		        }
+		        .padding(.horizontal, 12)
+		        .padding(.vertical, 9)
+		        .background(isOutgoing ? Color.accentColor : Color.gray.opacity(0.14))
+		        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+		        .contextMenu {
+		            Button("Copy text") {
+		                UIPasteboard.general.string = message.text
+		            }
+		        }
+		        .frame(maxWidth: maxBubbleWidth, alignment: .leading)
+		    }
 
 	    private func imageBubble(attachment: MessageAttachment, isOutgoing: Bool, maxBubbleWidth: CGFloat) -> some View {
 	        let maxSide: CGFloat = 240
 	        let maxW: CGFloat = min(maxBubbleWidth, maxSide)
 	        let maxH: CGFloat = maxSide
 	        let bubbleShape = RoundedRectangle(cornerRadius: 16, style: .continuous)
+	        let borderColor = Color.primary.opacity(isOutgoing ? 0.12 : 0.10)
 
 	        if let path = resolvedAttachmentPath(attachment),
 	           let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
@@ -703,6 +713,7 @@ private struct ProfileAvatarSizer: ViewModifier {
 	                        .resizable()
 	                        .aspectRatio(aspect, contentMode: .fit)
 	                        .frame(width: fitted.width, height: fitted.height)
+	                        .clipped()
 
 	                    HStack(spacing: 6) {
 	                        Text(message.timestamp, style: .time)
@@ -719,7 +730,18 @@ private struct ProfileAvatarSizer: ViewModifier {
 	                    .padding(8)
 	                }
 	                .frame(width: fitted.width, height: fitted.height, alignment: .bottomTrailing)
+	                .compositingGroup()
 	                .clipShape(bubbleShape)
+	                .overlay(bubbleShape.strokeBorder(borderColor, lineWidth: 0.75))
+	                .contentShape(bubbleShape)
+	                .contextMenu {
+	                    Button("Copy image") {
+	                        copyImageToPasteboard(data: data, path: path, mime: attachment.mime)
+	                    }
+	                }
+	                .onTapGesture {
+	                    imagePreview = IdentifiableImage(image: uiImage)
+	                }
 	            )
 	        }
 
@@ -731,37 +753,108 @@ private struct ProfileAvatarSizer: ViewModifier {
 	                    .foregroundStyle(.secondary)
 	            }
 	            .frame(width: maxW, height: maxH)
+	            .overlay(bubbleShape.strokeBorder(borderColor, lineWidth: 0.75))
 	        )
 	    }
 
-		    @ViewBuilder
-		    private func attachmentPreview(_ attachment: MessageAttachment, maxWidth: CGFloat) -> some View {
-		        let maxSide: CGFloat = 240
-		        let maxW: CGFloat = min(maxWidth, maxSide)
-		        let maxH: CGFloat = maxSide
-	        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+	    private struct IdentifiableImage: Identifiable {
+	        let id = UUID()
+	        let image: UIImage
+	    }
 
-	        if let path = resolvedAttachmentPath(attachment),
-	           let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-	           let uiImage = UIImage(data: data) {
-	            let imgSize = uiImage.size
-	            let aspect = (imgSize.height > 0) ? (imgSize.width / imgSize.height) : 1
-	            let fitted = fittedAttachmentSize(imageSize: imgSize, maxW: maxW, maxH: maxH)
+	    private struct ImageFullscreenPreview: View {
+	        let image: UIImage
+	        @Environment(\.dismiss) private var dismiss
+	        @State private var scale: CGFloat = 1
+	        @State private var lastScale: CGFloat = 1
+	        @State private var offset: CGSize = .zero
+	        @State private var lastOffset: CGSize = .zero
 
-	            Image(uiImage: uiImage)
-	                .resizable()
-	                .aspectRatio(aspect, contentMode: .fit)
-	                .frame(width: fitted.width, height: fitted.height)
-	                .clipShape(shape)
-	        } else {
-	            ZStack {
-	                shape.fill(Color.gray.opacity(0.18))
-	                Image(systemName: "photo")
-	                    .font(.system(size: 22))
-	                    .foregroundStyle(.secondary)
+	        var body: some View {
+	            GeometryReader { proxy in
+	                ZStack {
+	                    Color.black.ignoresSafeArea()
+
+	                    Image(uiImage: image)
+	                        .resizable()
+	                        .scaledToFit()
+	                        .frame(width: proxy.size.width, height: proxy.size.height)
+	                        .scaleEffect(scale)
+	                        .offset(offset)
+	                        .gesture(magnificationGesture)
+	                        .simultaneousGesture(dragGesture)
+	                        .onTapGesture(count: 2) {
+	                            withAnimation(.spring(response: 0.28, dampingFraction: 0.9)) {
+	                                if scale > 1 {
+	                                    scale = 1
+	                                    lastScale = 1
+	                                    offset = .zero
+	                                    lastOffset = .zero
+	                                } else {
+	                                    scale = 2
+	                                    lastScale = 2
+	                                }
+	                            }
+	                        }
+
+	                    VStack {
+	                        HStack {
+	                            Spacer()
+	                            Button {
+	                                dismiss()
+	                            } label: {
+	                                Image(systemName: "xmark.circle.fill")
+	                                    .font(.system(size: 28, weight: .semibold))
+	                                    .foregroundStyle(.white.opacity(0.9))
+	                            }
+	                            .padding(16)
+	                        }
+	                        Spacer()
+	                    }
+	                }
+	                .onTapGesture {
+	                    dismiss()
+	                }
 	            }
-	            .frame(width: maxW, height: maxH)
 	        }
+
+	        private var magnificationGesture: some Gesture {
+	            MagnificationGesture()
+	                .onChanged { value in
+	                    let next = lastScale * value
+	                    scale = min(max(next, 1), 5)
+	                }
+	                .onEnded { _ in
+	                    lastScale = scale
+	                    if scale == 1 {
+	                        offset = .zero
+	                        lastOffset = .zero
+	                    }
+	                }
+	        }
+
+	        private var dragGesture: some Gesture {
+	            DragGesture()
+	                .onChanged { value in
+	                    guard scale > 1 else { return }
+	                    offset = CGSize(width: lastOffset.width + value.translation.width, height: lastOffset.height + value.translation.height)
+	                }
+	                .onEnded { _ in
+	                    lastOffset = offset
+	                }
+	        }
+	    }
+
+	    private func copyImageToPasteboard(data: Data, path: String, mime: String?) {
+	        let url = URL(fileURLWithPath: path)
+	        let contentType: UTType = {
+	            if let mime, let type = UTType(mimeType: mime) { return type }
+	            let ext = url.pathExtension
+	            if !ext.isEmpty, let type = UTType(filenameExtension: ext) { return type }
+	            return .data
+	        }()
+
+	        UIPasteboard.general.setData(data, forPasteboardType: contentType.identifier)
 	    }
 
 	    private func fittedAttachmentSize(imageSize: CGSize, maxW: CGFloat, maxH: CGFloat) -> CGSize {
@@ -779,53 +872,53 @@ private struct ProfileAvatarSizer: ViewModifier {
 	        return CGSize(width: width, height: height)
 	    }
 
-    private func resolvedAttachmentPath(_ attachment: MessageAttachment) -> String? {
-        let fm = FileManager.default
-        if let p = attachment.localPath, !p.isEmpty, fm.fileExists(atPath: p) {
-            return p
-        }
-        let hash = attachment.hashHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !hash.isEmpty else { return nil }
-        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let base = appSupport.appendingPathComponent("Runcore", isDirectory: true)
+	    private func resolvedAttachmentPath(_ attachment: MessageAttachment) -> String? {
+	        let fm = FileManager.default
+	        if let p = attachment.localPath, !p.isEmpty, fm.fileExists(atPath: p) {
+	            return p
+	        }
+	        let hash = attachment.hashHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+	        guard !hash.isEmpty else { return nil }
+	        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+	        let base = appSupport.appendingPathComponent("Runcore", isDirectory: true)
 
-        switch message.direction {
-        case .outbound:
-            return base.appendingPathComponent("attachments", isDirectory: true)
-                .appendingPathComponent("out", isDirectory: true)
-                .appendingPathComponent("\(hash).bin")
-                .path
-        case .inbound:
-            let remote = contactDestHashHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard !remote.isEmpty else { return nil }
-            return base.appendingPathComponent("attachments", isDirectory: true)
-                .appendingPathComponent("in", isDirectory: true)
-                .appendingPathComponent(remote, isDirectory: true)
-                .appendingPathComponent("\(hash).bin")
-                .path
-        }
-    }
+	        switch message.direction {
+	        case .outbound:
+	            return base.appendingPathComponent("attachments", isDirectory: true)
+	                .appendingPathComponent("out", isDirectory: true)
+	                .appendingPathComponent("\(hash).bin")
+	                .path
+	        case .inbound:
+	            let remote = contactDestHashHex.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+	            guard !remote.isEmpty else { return nil }
+	            return base.appendingPathComponent("attachments", isDirectory: true)
+	                .appendingPathComponent("in", isDirectory: true)
+	                .appendingPathComponent(remote, isDirectory: true)
+	                .appendingPathComponent("\(hash).bin")
+	                .path
+	        }
+	    }
 
-    @ViewBuilder
-    private var receiptMarks: some View {
-        switch message.outboundStatus {
-        case .delivered:
-            Image(systemName: "checkmark")
-                .font(.caption2)
-                .foregroundStyle(.white.opacity(0.75))
-        case .read:
-            HStack(spacing: 1) {
-                Image(systemName: "checkmark")
-                Image(systemName: "checkmark")
-            }
-            .font(.caption2)
-            .foregroundStyle(.white.opacity(0.75))
-        case .failed:
-            Image(systemName: "exclamationmark.circle")
-                .font(.caption2)
-                .foregroundStyle(.white.opacity(0.85))
-        case .pending, .none:
-            EmptyView()
-        }
-    }
+	    @ViewBuilder
+	    private var receiptMarks: some View {
+	        switch message.outboundStatus {
+	        case .delivered:
+	            Image(systemName: "checkmark")
+	                .font(.caption2)
+	                .foregroundStyle(.white.opacity(0.75))
+	        case .read:
+	            HStack(spacing: 1) {
+	                Image(systemName: "checkmark")
+	                Image(systemName: "checkmark")
+	            }
+	            .font(.caption2)
+	            .foregroundStyle(.white.opacity(0.75))
+	        case .failed:
+	            Image(systemName: "exclamationmark.circle")
+	                .font(.caption2)
+	                .foregroundStyle(.white.opacity(0.85))
+	        case .pending, .none:
+	            EmptyView()
+	        }
+	    }
 }
