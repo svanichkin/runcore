@@ -16,6 +16,9 @@
 
 - Contacts/chats/profile/log are stored in `Documents/Runcore/state.json` (JSON).
 - Outbound pending: if there is no path/identity, the message stays `pending` and the app retries delivery.
+- Message bubbles: text and image attachment rows.
+- Image attachments: rounded corners + subtle border, tap to view fullscreen (pinch-to-zoom + pan).
+- Copy support: long-press context menu to copy message text; copy image puts the original attachment bytes on the pasteboard (for pasting elsewhere).
 - Diagnostics screen: logs, interfaces, view/edit `config` and `rns/config`, announces list.
 - Blocklist: inbound from blocked destination hashes are dropped at the UI level.
 
