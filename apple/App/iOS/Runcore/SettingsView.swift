@@ -43,11 +43,11 @@ struct SettingsView: View {
             settingsList
         } detail: {
             NavigationStack {
-                SettingsDetail(destination: selection)
+                SettingsDetail(destination: $selection)
                     .environmentObject(store)
             }
             .navigationDestination(for: SettingsDestination.self) { dest in
-                SettingsDetail(destination: dest)
+                SettingsDetail(destination: .constant(dest))
                     .environmentObject(store)
             }
         }
@@ -88,7 +88,7 @@ struct SettingsView: View {
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
         .navigationDestination(for: SettingsDestination.self) { dest in
-            SettingsDetail(destination: dest)
+            SettingsDetail(destination: .constant(dest))
                 .environmentObject(store)
         }
         .toolbar {
@@ -110,12 +110,12 @@ struct SettingsView: View {
 
 private struct SettingsDetail: View {
     @EnvironmentObject private var store: AppStore
-    let destination: SettingsDestination?
+    @Binding var destination: SettingsDestination?
 
     var body: some View {
         switch destination {
         case .profile:
-            ProfileDetailView()
+            ProfileDetailView(onBack: { destination = nil })
                 .environmentObject(store)
         case .section(let section):
             switch section {
@@ -221,6 +221,7 @@ private struct ProfileDetailView: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    let onBack: (() -> Void)?
     @State private var nameDraft: String = ""
     @State private var lastSavedName: String = ""
 
@@ -239,10 +240,14 @@ private struct ProfileDetailView: View {
         )
         .navigationBarBackButtonHidden(horizontalSizeClass == .compact)
         .toolbar {
-            if horizontalSizeClass == .compact {
-                ToolbarItem(placement: .navigationBarLeading) {
+            if horizontalSizeClass != .regular {
+                ToolbarItem(placement: .topBarLeading) {
                     Button {
-                        dismiss()
+                        if let onBack {
+                            onBack()
+                        } else {
+                            dismiss()
+                        }
                     } label: {
                         Image(systemName: "chevron.left")
                     }
