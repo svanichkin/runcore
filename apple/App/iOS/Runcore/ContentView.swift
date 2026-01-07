@@ -42,7 +42,7 @@ private struct InboundPromptSheet: View {
     let prompt: AppStore.InboundPrompt
 
     var body: some View {
-        let name = store.displayNameForDestinationHashHex(prompt.destHashHex)
+        let name = store.inboundPromptDisplayName ?? store.displayNameForDestinationHashHex(prompt.destHashHex)
         VStack(spacing: 14) {
             Text(name)
                 .font(.title3)

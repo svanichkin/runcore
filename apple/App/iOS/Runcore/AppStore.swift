@@ -31,6 +31,7 @@ final class AppStore: ObservableObject {
     @Published var debugLoggingEnabled: Bool = false
     @Published var blockedDestinations: [String] = []
     @Published var inboundPrompt: InboundPrompt?
+    @Published var inboundPromptDisplayName: String?
     @Published var inboundPromptAvatarData: Data?
     @Published var inboundPromptAvatarHashHex: String?
     @Published var inboundPromptIsLoadingAvatar: Bool = false
@@ -1073,6 +1074,7 @@ final class AppStore: ObservableObject {
 
     private func prefetchInboundPromptAvatarIfNeeded() {
         inboundAvatarTask?.cancel()
+        inboundPromptDisplayName = nil
         inboundPromptAvatarData = nil
         inboundPromptAvatarHashHex = nil
         inboundPromptIsLoadingAvatar = false
@@ -1086,6 +1088,11 @@ final class AppStore: ObservableObject {
         inboundAvatarTask = Task { @MainActor in
             let preview = await resolveContactPreview(destHashHex: dest, timeoutMs: 20_000)
             guard inboundPrompt?.id == promptID else { return }
+
+            let resolvedName = preview?.displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let resolvedName, !resolvedName.isEmpty {
+                inboundPromptDisplayName = resolvedName
+            }
 
             if let avatar = preview?.avatarData, !avatar.isEmpty {
                 inboundPromptAvatarData = avatar
