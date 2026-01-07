@@ -22,6 +22,16 @@
 - Diagnostics screen: logs, interfaces, view/edit `config` and `rns/config`, announces list.
 - Blocklist: inbound from blocked destination hashes are dropped at the UI level.
 
+## Screenshots
+
+| Chats | Image bubble (border + rounding) |
+| --- | --- |
+| ![Chats](screenshots/screenshot_1.png) | ![Image bubble](screenshots/screenshot_2.png) |
+
+| Fullscreen preview | Diagnostics |
+| --- | --- |
+| ![Fullscreen preview](screenshots/screenshot_3.png) | ![Diagnostics](screenshots/screenshot_4.png) |
+
 ## Quick start
 
 Running without arguments creates an `lxmd`-compatible config directory and a default `config`.
